@@ -50,9 +50,19 @@ Deep Layer  ─── headless_chrome (DevTools Protocol)
 단순 "요청 → 결과" 구조가 아니라, 응답을 분석해 다음 공격을 변형한다.
 
 ```
-응답 분석 → 403 감지 → Bypass 헤더 4개 동시 경쟁(select_ok) → 재요청
-             ↓
-          SQLi 오류 시그니처 감지 → 파라미터별 페이로드 병렬 집중(join_all)
+Phase A (패시브)
+    └─ base_resp 1회 GET → 보안 헤더 / CORS / 쿠키 / Mixed Content / 정보 유출
+
+Phase B (능동, 병렬 — tokio::join!)
+    ├─ SQLi (에러 기반 14종 + Time-based blind) → join_all 파라미터별
+    ├─ Path Traversal → 5개 페이로드, 5개 OS 시그니처
+    ├─ Command Injection → echo-based + time-based (elapsed_ms ≥ 4.5s)
+    ├─ CRLF Injection → 헤더 주입 확인
+    └─ Open Redirect → 리디렉션 파라미터 7종
+
+Phase C
+    ├─ HTTP Method 검사 (OPTIONS → TRACE/PUT/DELETE)
+    └─ 403 Bypass (5개 헤더 + 6개 경로 변형 → select_ok 경쟁)
 ```
 
 ### 2.3 Turing-Complete 확장
@@ -127,11 +137,10 @@ Orchestrator::run()
     │
     ├─ [병렬] Phase 4 + Phase 5  ← tokio::join!
     │   ├─ Phase 4: HTTP 취약점 점검
-    │   │   ├─ 보안 헤더 누락 검사 (기존 응답 재사용, 추가 GET 없음)
-    │   │   ├─ SQLi 오류 기반 탐지 (파라미터별 join_all 병렬)
-    │   │   ├─ 오픈 리디렉션 탐지
-    │   │   ├─ 쿠키 보안 속성 검사 (기존 응답 재사용)
-    │   │   └─ 403 Bypass (4개 헤더 select_ok 경쟁)
+    │   │   ├─ [패시브] 보안 헤더 6종 / CORS / 쿠키 / Mixed Content / 정보 유출
+    │   │   ├─ [능동, 병렬] SQLi (에러+Blind) / Path Traversal / CMDi / CRLF / Open Redirect
+    │   │   ├─ HTTP Method 검사 (OPTIONS)
+    │   │   └─ 403 Bypass (5개 헤더 + 6개 경로 변형, select_ok 경쟁)
     │   └─ Phase 5: Lua 스크립트 실행
     │               (scripts/*.lua 파일 → spawn_blocking 병렬)
     │
@@ -151,8 +160,8 @@ tokio::main (multi_thread)
     │
     ├─ Phase 4+5 병렬 ─── tokio::join!(analyzer.run(), engine.run_all())
     │   │
-    │   ├─ analyzer: join_all(파라미터별 SQLi 태스크들)
-    │   │             select_ok(4개 403 bypass 헤더)
+    │   ├─ analyzer: tokio::join!(SQLi, Traversal, CMDi, CRLF, Redirect)
+    │   │             select_ok(5헤더 + 6경로변형 403 bypass)
     │   │
     │   └─ engine:   spawn_blocking(Lua VM) × N 스크립트
     │
@@ -170,22 +179,48 @@ tokio::main (multi_thread)
 | 카테고리 | 항목 | 심각도 |
 |----------|------|--------|
 | 기술 스택 | Apache, Nginx, IIS, WordPress, Drupal, Joomla, Laravel, Django, Spring, Express, PHP, ASP.NET | Info |
-| 데이터베이스 | MySQL 에러 노출, PostgreSQL 에러 노출 | Info |
+| 데이터베이스 | MySQL, PostgreSQL 에러 노출 | Info |
 | CVE | 탐지된 기술 스택 버전 기반 CVE 매칭 | High |
 | 포트 | 21/22/23/25/53/80/443/3306/3389/5432/6379/8080 등 29개 | Info |
-| 보안 헤더 | X-Frame-Options, X-Content-Type-Options, HSTS, CSP | Low |
-| SQLi | 에러 기반 (SQL 문법 오류 시그니처, 6종) | High |
+| 보안 헤더 | X-Frame-Options, X-Content-Type-Options, HSTS (max-age 검증), CSP, Referrer-Policy, Permissions-Policy | Low |
+| CORS | 와일드카드 오리진(*), 오리진 반사, Credentials 조합 | Medium~High |
+| SQLi | 에러 기반 (14종 시그니처) + Time-based blind (SLEEP/pg_sleep/WAITFOR) | High |
+| Path Traversal | `../../etc/passwd` 등 5개 페이로드, 5개 OS 시그니처 | High |
+| Command Injection | echo-based 4종 + time-based 4종 (elapsed_ms ≥ 4.5s) | Critical |
+| CRLF Injection | `%0d%0a` 헤더 주입, 응답 헤더 반영 확인 | High |
 | 쿠키 | HttpOnly/Secure/SameSite 속성 누락 | Medium |
-| 오픈 리디렉션 | redirect/url/next/return 등 파라미터 | Medium |
+| 오픈 리디렉션 | redirect/url/next/return/goto 등 7개 파라미터 | Medium |
 | XSS (DOM) | `<script>`, `<img onerror>`, `<svg onload>` 등 | High |
 | XSS (Reflected) | URL 파라미터를 통한 JS 실행 확인 | High |
-| 403 Bypass | X-Forwarded-For, X-Original-URL 등 우회 헤더 | Medium |
+| 403 Bypass | 5개 우회 헤더 + 6개 경로 변형 (대소문자, URL 인코딩, dot segment 등) | Medium |
+| HTTP 메서드 | OPTIONS → TRACE/PUT/DELETE 허용 탐지 | Medium |
+| 정보 유출 | 서버 버전, X-Powered-By, 디버그 헤더 6종 | Low |
+| Mixed Content | HTTPS 페이지의 HTTP 리소스 로드 | Medium |
 
 ### 4.2 Lua 스크립트 (플러그인)
 
-기본 제공:
-- `example_custom_check.lua` — `.git/HEAD` 노출 탐지
-- `env_file_check.lua` — `.env` 파일 자격증명 노출 탐지
+총 18개 기본 제공:
+
+| 스크립트 | 탐지 대상 | 심각도 |
+|----------|-----------|--------|
+| `example_custom_check.lua` | `.git/HEAD` 노출 | High |
+| `env_file_check.lua` | `.env` 파일 자격증명 노출 | Critical |
+| `ssrf_probe.lua` | 내부 IP / 클라우드 메타데이터 SSRF | Critical |
+| `ssti_probe.lua` | 템플릿 인젝션 (Jinja2/FreeMarker/ERB 등) | Critical |
+| `debug_endpoints.lua` | Actuator/Telescope/Werkzeug/Swagger 등 16개 | Critical |
+| `wp_config_backup.lua` | WordPress 설정 백업 8개 경로 | Critical |
+| `graphql_introspection.lua` | GraphQL 스키마 인트로스펙션 | High |
+| `cors_check.lua` | Origin 반사 CORS 테스트 | High |
+| `host_header_injection.lua` | Host 헤더 주입 (비밀번호 초기화 중독) | High |
+| `htaccess_exposure.lua` | `.htaccess`/`.htpasswd`/`web.config` 노출 | High |
+| `backup_files.lua` | .zip/.sql/.tar 등 백업 파일 탐지 | High |
+| `cve_js_libs.lua` | jQuery/Angular/Lodash/Bootstrap 취약 버전 | High |
+| `admin_panels.lua` | 관리자/로그인 페이지 13개 경로 | Medium |
+| `robots_sitemap.lua` | robots.txt 민감 경로 + sitemap.xml | Medium |
+| `source_map.lua` | .js.map 소스맵 노출 | Medium |
+| `info_disclosure.lua` | phpinfo/server-status/health 등 9개 | Medium |
+| `error_page_leak.lua` | 에러 페이지 스택 트레이스/경로 유출 | Medium |
+| `jsonp_callback.lua` | JSONP 콜백 엔드포인트 | Medium |
 
 ---
 
@@ -278,7 +313,11 @@ loadfile→ nil
 
 스크립트에서 허용된 API:
 - `http.get(url)` — HTTP GET 요청
+- `http.post(url, body)` — HTTP POST 요청
+- `http.head(url)` — HTTP HEAD 요청 (바디 수신 생략)
+- `http.get_with_headers(url, {key=val})` — 커스텀 헤더 GET 요청
 - `report.finding(severity, category, title, description, url)` — 결과 보고
+- 응답 필드: `status`, `body`, `headers`, `url` (최종 URL), `elapsed_ms` (응답 시간)
 
 ### Docker 최소 권한
 
@@ -344,7 +383,7 @@ loadfile→ nil
 - CVE DB가 비어 있음 — NVD/MITRE 데이터 임포트 스크립트 미구현
 - 인증 세션 처리 없음 (로그인 후 스캔 불가)
 - 크롤링 미구현 (단일 URL만 분석, 링크 추적 없음)
-- SSRF/XXE/SSTI 탐지 플러그인 미제공 (Lua로 확장 가능)
+- XXE 탐지 플러그인 미제공 (Lua로 확장 가능)
 
 ### 향후 로드맵
 
@@ -353,7 +392,7 @@ loadfile→ nil
 | 높음 | NVD JSON 피드 임포트 (`sentinel import-cve`) |
 | 높음 | 재귀 크롤러 (robots.txt 준수) |
 | 중간 | 인증 세션 지원 (`--cookie`, `--auth-header`) |
-| 중간 | SSRF/SSTI/XXE Lua 플러그인 기본 제공 |
+| 중간 | XXE Lua 플러그인 추가 |
 | 낮음 | HTML 리포트 출력 |
 | 낮음 | ARM64 Linux 공식 빌드 지원 |
 

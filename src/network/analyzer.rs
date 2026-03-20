@@ -1,13 +1,20 @@
 use anyhow::Result;
 use futures::future::{join_all, select_ok};
+use regex::Regex;
+use std::future::Future;
 use std::pin::Pin;
+use std::sync::OnceLock;
 use tracing::{debug, warn};
 
 use crate::core::scanner::{Finding, FindingCategory, ScanContext, Severity};
 use crate::network::http::{HttpClient, HttpResponse};
 use crate::network::scope::ScopeGuard;
 
-/// SQL 오류 시그니처 — 소문자, 정적 상수 (⑤ 할당 없는 검색용)
+// ─────────────────────────────────────────────────────────────────────────────
+// Static data — zero-alloc at search time
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// SQL error signatures (lowercase bytes)
 static SQL_ERROR_SIGS: &[&[u8]] = &[
     b"you have an error in your sql syntax",
     b"unclosed quotation mark",
@@ -15,9 +22,75 @@ static SQL_ERROR_SIGS: &[&[u8]] = &[
     b"pg_query()",
     b"sqlstate",
     b"ora-01756",
+    b"microsoft ole db provider",
+    b"odbc sql server driver",
+    b"mysql_num_rows()",
+    b"mysql_fetch_array()",
+    b"supplied argument is not a valid mysql",
+    b"org.postgresql.util.psqlexception",
+    b"unterminated string",
+    b"syntax error at or near",
 ];
 
-static SQL_PAYLOADS: &[&str] = &["'", "\"", "1' OR '1'='1", "1\"OR\"1\"=\"1"];
+/// Error-based + Union + simple boolean payloads
+static SQL_PAYLOADS: &[&str] = &[
+    "'",
+    "\"",
+    "1' OR '1'='1",
+    "1\"OR\"1\"=\"1",
+    "1' UNION SELECT NULL--",
+    "1' UNION SELECT NULL,NULL--",
+    "1 OR 1=1--",
+    "' OR ''='",
+];
+
+/// Time-based blind SQLi payloads (expect >= 4500ms response)
+static SQL_TIME_PAYLOADS: &[&str] = &[
+    "1' AND SLEEP(5)--",
+    "1' AND pg_sleep(5)--",
+    "1'; WAITFOR DELAY '0:0:5'--",
+];
+
+const SQL_TIME_THRESHOLD_MS: u64 = 4500;
+
+/// Path traversal payloads
+static TRAVERSAL_PAYLOADS: &[&str] = &[
+    "../../etc/passwd",
+    "..\\..\\windows\\win.ini",
+    "....//....//etc/passwd",
+    "..%2f..%2fetc%2fpasswd",
+    "..%252f..%252fetc%252fpasswd",
+];
+
+static TRAVERSAL_SIGS: &[&[u8]] = &[
+    b"root:x:0:0:",
+    b"daemon:x:",
+    b"[boot loader]",
+    b"[fonts]",
+    b"; for 16-bit app support",
+];
+
+/// Command injection payloads — echo-based (signature in response body)
+static CMDI_ECHO_PAYLOADS: &[(&str, &[u8])] = &[
+    (";echo SENTINEL_CMDI_7f3a", b"SENTINEL_CMDI_7f3a"),
+    ("|echo SENTINEL_CMDI_7f3a", b"SENTINEL_CMDI_7f3a"),
+    ("$(echo SENTINEL_CMDI_7f3a)", b"SENTINEL_CMDI_7f3a"),
+    ("`echo SENTINEL_CMDI_7f3a`", b"SENTINEL_CMDI_7f3a"),
+];
+
+/// Command injection — time-based (expect >= 4500ms)
+static CMDI_TIME_PAYLOADS: &[&str] = &[
+    ";sleep 5",
+    "|sleep 5",
+    "$(sleep 5)",
+    "`sleep 5`",
+];
+
+/// CRLF injection payloads: (payload, header name to look for in response)
+static CRLF_PAYLOADS: &[(&str, &str)] = &[
+    ("%0d%0aX-Injected:sentinel", "x-injected"),
+    ("%0d%0aSet-Cookie:sentinel_crlf=1", "sentinel_crlf"),
+];
 
 static REDIRECT_PARAMS: &[&str] = &[
     "redirect", "url", "next", "return", "goto", "continue", "dest",
@@ -28,9 +101,29 @@ static BYPASS_HEADERS: &[(&str, &str)] = &[
     ("X-Original-URL",            "/"),
     ("X-Custom-IP-Authorization", "127.0.0.1"),
     ("X-Forwarded-Host",          "localhost"),
+    ("X-Real-IP",                 "127.0.0.1"),
 ];
 
-/// Feedback loop: analyze HTTP responses and adapt payloads
+/// Debug/info headers that shouldn't be exposed in production
+static DEBUG_HEADERS: &[&str] = &[
+    "x-debug-token",
+    "x-debug-token-link",
+    "x-debugging",
+    "x-aspnet-version",
+    "x-aspnetmvc-version",
+    "x-request-id",
+];
+
+/// Dangerous HTTP methods
+static DANGEROUS_METHODS: &[&str] = &["TRACE", "PUT", "DELETE"];
+
+/// Mixed content regex (compiled once)
+static MIXED_CONTENT_RE: OnceLock<Regex> = OnceLock::new();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ResponseAnalyzer
+// ─────────────────────────────────────────────────────────────────────────────
+
 pub struct ResponseAnalyzer {
     ctx: ScanContext,
     client: HttpClient,
@@ -39,6 +132,9 @@ pub struct ResponseAnalyzer {
 
 impl ResponseAnalyzer {
     pub fn new(ctx: ScanContext, client: HttpClient, scope: ScopeGuard) -> Self {
+        MIXED_CONTENT_RE.get_or_init(|| {
+            Regex::new(r#"(?:src|href|action)\s*=\s*["']http://"#).unwrap()
+        });
         Self { ctx, client, scope }
     }
 
@@ -52,60 +148,77 @@ impl ResponseAnalyzer {
             target, self.ctx.config.timeout_secs
         );
 
-        // ① 단 1회 GET — check_security_headers, check_cookies, 403 판단에 재사용
+        // ── Phase A: single GET, reused by all passive checks ───────────
         let base_resp = self.client.get(target).await?;
 
         let mut findings = Vec::new();
-
-        // ① 참조 전달 (추가 GET 없음)
         findings.extend(check_security_headers(&base_resp, target));
+        findings.extend(check_cors(&base_resp, target));
         findings.extend(check_cookies(&base_resp, target));
+        findings.extend(check_mixed_content(&base_resp, target));
+        findings.extend(check_info_disclosure(&base_resp, target));
 
-        // ③ SQLi — 파라미터별 병렬 (별도 URL 필요하므로 GET은 각자)
-        findings.extend(self.check_sqli(target).await?);
+        // ── Phase B: active injection checks (all parallel) ─────────────
+        let (sqli, traversal, cmdi, crlf, redirect) = tokio::join!(
+            self.check_sqli(target),
+            self.check_path_traversal(target),
+            self.check_cmdi(target),
+            self.check_crlf(target),
+            self.check_open_redirect(target),
+        );
+        findings.extend(sqli?);
+        findings.extend(traversal?);
+        findings.extend(cmdi?);
+        findings.extend(crlf?);
+        findings.extend(redirect?);
 
-        // open redirect (URL 파라미터 조작 필요 → 별도 GET)
-        findings.extend(self.check_open_redirect(target).await?);
+        // ── Phase C: special requests ───────────────────────────────────
+        findings.extend(self.check_http_methods(target).await?);
 
-        // ① 403 판단도 이미 받은 응답 재사용
         if base_resp.status == 403 {
             if let Ok(Some(bypassed)) = try_403_bypass(&self.client, target).await {
-                debug!(
-                    "403 bypass succeeded for {} (status: {})",
-                    target, bypassed.status
+                let mut f = Finding::new(
+                    Severity::Medium,
+                    FindingCategory::Custom,
+                    "403 Bypass Successful",
+                    format!(
+                        "Access control bypassed — response status {} instead of 403",
+                        bypassed.status
+                    ),
+                    target.to_string(),
                 );
+                f.remediation = Some(
+                    "Enforce access control at application layer, not just middleware".to_string(),
+                );
+                findings.push(f);
             }
         }
 
         Ok(findings)
     }
 
-    // ③ SQLi: 파라미터별 futures 생성 후 join_all
+    // ── SQLi: error-based + time-based blind ────────────────────────────
     async fn check_sqli(&self, url: &str) -> Result<Vec<Finding>> {
         let parsed = match url::Url::parse(url) {
             Ok(p) => p,
             Err(_) => return Ok(vec![]),
         };
-
         let original_query: Vec<(String, String)> = parsed
             .query_pairs()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-
         if original_query.is_empty() {
             return Ok(vec![]);
         }
 
-        // 파라미터별 async 블록 생성 — 모두 동시 실행
         let tasks: Vec<_> = original_query
             .iter()
             .map(|(param_name, _)| {
-                let client      = self.client.clone();
-                let scope       = self.scope.clone();
-                let param_name  = param_name.clone();
-                let orig_query  = original_query.clone();
-                let url_str     = url.to_string();
-
+                let client     = self.client.clone();
+                let scope      = self.scope.clone();
+                let param_name = param_name.clone();
+                let orig_query = original_query.clone();
+                let url_str    = url.to_string();
                 async move {
                     sqli_probe_param(client, scope, url_str, param_name, orig_query).await
                 }
@@ -116,6 +229,129 @@ impl ResponseAnalyzer {
         Ok(results.into_iter().flatten().collect())
     }
 
+    // ── Path Traversal ──────────────────────────────────────────────────
+    async fn check_path_traversal(&self, url: &str) -> Result<Vec<Finding>> {
+        let parsed = match url::Url::parse(url) {
+            Ok(p) => p,
+            Err(_) => return Ok(vec![]),
+        };
+        let original_query: Vec<(String, String)> = parsed
+            .query_pairs()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        if original_query.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let tasks: Vec<_> = original_query
+            .iter()
+            .map(|(param_name, _)| {
+                let client     = self.client.clone();
+                let scope      = self.scope.clone();
+                let param_name = param_name.clone();
+                let orig_query = original_query.clone();
+                let url_str    = url.to_string();
+                async move {
+                    traversal_probe_param(client, scope, url_str, param_name, orig_query).await
+                }
+            })
+            .collect();
+
+        let results = join_all(tasks).await;
+        Ok(results.into_iter().flatten().collect())
+    }
+
+    // ── Command Injection ───────────────────────────────────────────────
+    async fn check_cmdi(&self, url: &str) -> Result<Vec<Finding>> {
+        let parsed = match url::Url::parse(url) {
+            Ok(p) => p,
+            Err(_) => return Ok(vec![]),
+        };
+        let original_query: Vec<(String, String)> = parsed
+            .query_pairs()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        if original_query.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let tasks: Vec<_> = original_query
+            .iter()
+            .map(|(param_name, _)| {
+                let client     = self.client.clone();
+                let scope      = self.scope.clone();
+                let param_name = param_name.clone();
+                let orig_query = original_query.clone();
+                let url_str    = url.to_string();
+                async move {
+                    cmdi_probe_param(client, scope, url_str, param_name, orig_query).await
+                }
+            })
+            .collect();
+
+        let results = join_all(tasks).await;
+        Ok(results.into_iter().flatten().collect())
+    }
+
+    // ── CRLF Injection ──────────────────────────────────────────────────
+    async fn check_crlf(&self, url: &str) -> Result<Vec<Finding>> {
+        let parsed = match url::Url::parse(url) {
+            Ok(p) => p,
+            Err(_) => return Ok(vec![]),
+        };
+        let original_query: Vec<(String, String)> = parsed
+            .query_pairs()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        if original_query.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut findings = Vec::new();
+        let mut parsed_mut = parsed;
+
+        for (param_name, _) in &original_query {
+            for (payload, expected_header) in CRLF_PAYLOADS {
+                let mut new_query = original_query.clone();
+                for (k, v) in &mut new_query {
+                    if k == param_name {
+                        v.push_str(payload);
+                    }
+                }
+                parsed_mut.query_pairs_mut().clear();
+                for (k, v) in &new_query {
+                    parsed_mut.query_pairs_mut().append_pair(k, v);
+                }
+
+                let test_url = parsed_mut.as_str().to_string();
+                if !self.scope.is_in_scope(&test_url) {
+                    continue;
+                }
+
+                if let Ok(resp) = self.client.get(&test_url).await {
+                    if resp.headers.keys().any(|k| k.contains(expected_header)) {
+                        let mut f = Finding::new(
+                            Severity::High,
+                            FindingCategory::CrlfInjection,
+                            format!("CRLF Injection in parameter '{}'", param_name),
+                            format!("Injected header '{}' appeared in response", expected_header),
+                            test_url,
+                        );
+                        f.evidence = Some(format!("Payload: {}", payload));
+                        f.remediation = Some(
+                            "Sanitize CR/LF characters (\\r\\n) from user input before use in HTTP headers".to_string(),
+                        );
+                        findings.push(f);
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(findings)
+    }
+
+    // ── Open Redirect ───────────────────────────────────────────────────
     async fn check_open_redirect(&self, url: &str) -> Result<Vec<Finding>> {
         let mut findings = Vec::new();
         let payload = "https://evil-example.com/";
@@ -162,18 +398,49 @@ impl ResponseAnalyzer {
 
         Ok(findings)
     }
+
+    // ── HTTP Method Check ───────────────────────────────────────────────
+    async fn check_http_methods(&self, url: &str) -> Result<Vec<Finding>> {
+        let mut findings = Vec::new();
+
+        if let Ok(resp) = self.client.options(url).await {
+            if let Some(allow) = resp.headers.get("allow") {
+                let allow_upper = allow.to_uppercase();
+                for method in DANGEROUS_METHODS {
+                    if allow_upper.contains(method) {
+                        let mut f = Finding::new(
+                            Severity::Medium,
+                            FindingCategory::InformationDisclosure,
+                            format!("Dangerous HTTP method enabled: {}", method),
+                            format!("OPTIONS response reveals '{}' is allowed", method),
+                            url.to_string(),
+                        );
+                        f.remediation = Some(format!("Disable {} method if not required", method));
+                        findings.push(f);
+                    }
+                }
+            }
+        }
+
+        Ok(findings)
+    }
 }
 
-// ① 참조만 받음 — 추가 GET 없음
+// ─────────────────────────────────────────────────────────────────────────────
+// Passive checks (free functions, no extra HTTP requests)
+// ─────────────────────────────────────────────────────────────────────────────
+
 fn check_security_headers(resp: &HttpResponse, url: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
     let headers = &resp.headers;
 
     let required = &[
-        ("x-frame-options",        "X-Frame-Options header missing (Clickjacking risk)"),
-        ("x-content-type-options", "X-Content-Type-Options header missing (MIME sniffing risk)"),
+        ("x-frame-options",           "X-Frame-Options missing (Clickjacking risk)"),
+        ("x-content-type-options",    "X-Content-Type-Options missing (MIME sniffing risk)"),
         ("strict-transport-security", "HSTS header missing"),
-        ("content-security-policy",   "Content-Security-Policy header missing"),
+        ("content-security-policy",   "Content-Security-Policy missing"),
+        ("referrer-policy",           "Referrer-Policy missing (token leak via Referer header)"),
+        ("permissions-policy",        "Permissions-Policy missing (browser feature restriction)"),
     ];
 
     for (header, desc) in required {
@@ -201,18 +468,71 @@ fn check_security_headers(resp: &HttpResponse, url: &str) -> Vec<Finding> {
                     url.to_string(),
                 ));
             }
+            // Check max-age >= 31536000 (1 year)
+            if let Some(max_age) = hsts
+                .split(';')
+                .find_map(|p| p.trim().strip_prefix("max-age="))
+            {
+                if let Ok(val) = max_age.trim().parse::<u64>() {
+                    if val < 31536000 {
+                        findings.push(Finding::new(
+                            Severity::Low,
+                            FindingCategory::MissingHeader,
+                            "HSTS max-age too short".to_string(),
+                            format!("max-age={} is less than 1 year (31536000)", val),
+                            url.to_string(),
+                        ));
+                    }
+                }
+            }
         }
     }
 
     findings
 }
 
-// ① 참조만 받음 — 추가 GET 없음 / ⑫ "set-cookie" 직접 비교
+fn check_cors(resp: &HttpResponse, url: &str) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let headers = &resp.headers;
+
+    if let Some(origin) = headers.get("access-control-allow-origin") {
+        if origin == "*" {
+            let creds = headers
+                .get("access-control-allow-credentials")
+                .map(|v| v == "true")
+                .unwrap_or(false);
+
+            if creds {
+                let mut f = Finding::new(
+                    Severity::High,
+                    FindingCategory::Cors,
+                    "CORS: wildcard origin with credentials",
+                    "Access-Control-Allow-Origin: * combined with Allow-Credentials: true allows credential theft".to_string(),
+                    url.to_string(),
+                );
+                f.remediation = Some("Never combine wildcard origin with credentials; whitelist specific origins".to_string());
+                findings.push(f);
+            } else {
+                let mut f = Finding::new(
+                    Severity::Medium,
+                    FindingCategory::Cors,
+                    "CORS: wildcard origin (*)",
+                    "Access-Control-Allow-Origin: * allows any site to read responses".to_string(),
+                    url.to_string(),
+                );
+                f.remediation = Some("Restrict to specific trusted origins".to_string());
+                findings.push(f);
+            }
+        }
+    }
+
+    findings
+}
+
 fn check_cookies(resp: &HttpResponse, url: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
 
     for (header_name, header_value) in &resp.headers {
-        // ⑫ to_lowercase() 제거 — reqwest HeaderName은 이미 소문자
         if header_name != "set-cookie" {
             continue;
         }
@@ -252,7 +572,108 @@ fn check_cookies(resp: &HttpResponse, url: &str) -> Vec<Finding> {
     findings
 }
 
-/// ③ 단일 파라미터에 대한 SQLi 프로브 (join_all로 병렬 호출됨)
+fn check_mixed_content(resp: &HttpResponse, url: &str) -> Vec<Finding> {
+    let mut findings = Vec::new();
+
+    if !url.starts_with("https://") {
+        return findings;
+    }
+
+    let re = MIXED_CONTENT_RE.get().expect("initialized in new()");
+    if re.is_match(&resp.body) {
+        let mut f = Finding::new(
+            Severity::Medium,
+            FindingCategory::MissingHeader,
+            "Mixed Content: HTTP resources on HTTPS page",
+            "Page loads resources over insecure HTTP, undermining TLS".to_string(),
+            url.to_string(),
+        );
+        f.remediation = Some("Use protocol-relative or HTTPS URLs for all resources".to_string());
+        findings.push(f);
+    }
+
+    findings
+}
+
+fn check_info_disclosure(resp: &HttpResponse, url: &str) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let headers = &resp.headers;
+
+    // Check debug headers
+    for header in DEBUG_HEADERS {
+        if headers.contains_key(*header) {
+            findings.push(Finding::new(
+                Severity::Low,
+                FindingCategory::InformationDisclosure,
+                format!("Debug header exposed: {}", header),
+                format!("Response contains '{}' header — debug information leak", header),
+                url.to_string(),
+            ));
+        }
+    }
+
+    // Server header with detailed version
+    if let Some(server) = headers.get("server") {
+        if server.contains('/') {
+            let mut f = Finding::new(
+                Severity::Low,
+                FindingCategory::InformationDisclosure,
+                "Server version disclosed",
+                format!("Server header reveals: {}", server),
+                url.to_string(),
+            );
+            f.remediation = Some("Remove version info from Server header".to_string());
+            findings.push(f);
+        }
+    }
+
+    // X-Powered-By with version
+    if let Some(xpb) = headers.get("x-powered-by") {
+        let mut f = Finding::new(
+            Severity::Low,
+            FindingCategory::InformationDisclosure,
+            "X-Powered-By header exposed",
+            format!("X-Powered-By reveals: {}", xpb),
+            url.to_string(),
+        );
+        f.remediation = Some("Remove X-Powered-By header".to_string());
+        findings.push(f);
+    }
+
+    findings
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Active probe functions (per-parameter, used with join_all)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Inject a payload into a specific URL parameter and return the modified URL
+fn inject_param(
+    base_url: &str,
+    param_name: &str,
+    payload: &str,
+    original_query: &[(String, String)],
+    append: bool,
+) -> Option<String> {
+    let mut parsed = url::Url::parse(base_url).ok()?;
+    let mut new_query: Vec<(String, String)> = original_query.to_vec();
+    for (k, v) in &mut new_query {
+        if k == param_name {
+            if append {
+                v.push_str(payload);
+            } else {
+                *v = payload.to_string();
+            }
+        }
+    }
+    parsed.query_pairs_mut().clear();
+    for (k, v) in &new_query {
+        parsed.query_pairs_mut().append_pair(k, v);
+    }
+    Some(parsed.as_str().to_string())
+}
+
+/// SQLi probe: error-based + time-based blind
 async fn sqli_probe_param(
     client: HttpClient,
     scope: ScopeGuard,
@@ -261,27 +682,14 @@ async fn sqli_probe_param(
     original_query: Vec<(String, String)>,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let Ok(mut parsed) = url::Url::parse(&url) else { return findings };
 
+    // Error-based
     for payload in SQL_PAYLOADS {
-        let mut new_query = original_query.clone();
-        for (k, v) in &mut new_query {
-            if k == &param_name {
-                *v = payload.to_string();
-            }
-        }
-        parsed.query_pairs_mut().clear();
-        for (k, v) in &new_query {
-            parsed.query_pairs_mut().append_pair(k, v);
-        }
-
-        let test_url = parsed.as_str().to_string();
-        if !scope.is_in_scope(&test_url) {
-            continue;
-        }
+        let Some(test_url) = inject_param(&url, &param_name, payload, &original_query, false)
+        else { continue };
+        if !scope.is_in_scope(&test_url) { continue; }
 
         if let Ok(resp) = client.get(&test_url).await {
-            // ⑤ to_lowercase() 제거 — 바이트 수준 대소문자 무관 검색
             let body_bytes = resp.body.as_bytes();
             for sig in SQL_ERROR_SIGS {
                 if memmem_find_icase(body_bytes, sig) {
@@ -291,18 +699,86 @@ async fn sqli_probe_param(
                         FindingCategory::SqlInjection,
                         format!("Potential SQLi in parameter '{}'", param_name),
                         format!(
-                            "SQL error signature '{}' found when injecting payload '{}'",
+                            "SQL error '{}' found with payload '{}'",
                             std::str::from_utf8(sig).unwrap_or("?"),
                             payload
                         ),
-                        test_url.clone(),
+                        test_url,
                     );
                     f.evidence    = Some(format!("Payload: {}", payload));
-                    f.remediation = Some(
-                        "Use parameterized queries / prepared statements".to_string(),
-                    );
+                    f.remediation = Some("Use parameterized queries / prepared statements".to_string());
                     findings.push(f);
-                    break;
+                    return findings; // one finding per param is enough
+                }
+            }
+        }
+    }
+
+    // Time-based blind (only if error-based found nothing)
+    for payload in SQL_TIME_PAYLOADS {
+        let Some(test_url) = inject_param(&url, &param_name, payload, &original_query, false)
+        else { continue };
+        if !scope.is_in_scope(&test_url) { continue; }
+
+        if let Ok(resp) = client.get(&test_url).await {
+            if resp.elapsed_ms >= SQL_TIME_THRESHOLD_MS {
+                debug!("SQLi time-based at {} param={} ({}ms)", url, param_name, resp.elapsed_ms);
+                let mut f = Finding::new(
+                    Severity::High,
+                    FindingCategory::SqlInjection,
+                    format!("Blind SQLi (time-based) in parameter '{}'", param_name),
+                    format!(
+                        "Response delayed {}ms (threshold {}ms) with payload '{}'",
+                        resp.elapsed_ms, SQL_TIME_THRESHOLD_MS, payload
+                    ),
+                    test_url,
+                );
+                f.evidence    = Some(format!("Payload: {} | Elapsed: {}ms", payload, resp.elapsed_ms));
+                f.remediation = Some("Use parameterized queries / prepared statements".to_string());
+                findings.push(f);
+                return findings;
+            }
+        }
+    }
+
+    findings
+}
+
+/// Path traversal probe
+async fn traversal_probe_param(
+    client: HttpClient,
+    scope: ScopeGuard,
+    url: String,
+    param_name: String,
+    original_query: Vec<(String, String)>,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+
+    for payload in TRAVERSAL_PAYLOADS {
+        let Some(test_url) = inject_param(&url, &param_name, payload, &original_query, false)
+        else { continue };
+        if !scope.is_in_scope(&test_url) { continue; }
+
+        if let Ok(resp) = client.get(&test_url).await {
+            let body_bytes = resp.body.as_bytes();
+            for sig in TRAVERSAL_SIGS {
+                if memmem_find_icase(body_bytes, sig) {
+                    debug!("Path traversal at {} param={}", url, param_name);
+                    let mut f = Finding::new(
+                        Severity::High,
+                        FindingCategory::DirectoryTraversal,
+                        format!("Path Traversal in parameter '{}'", param_name),
+                        format!(
+                            "File content signature '{}' found with payload '{}'",
+                            std::str::from_utf8(sig).unwrap_or("?"),
+                            payload
+                        ),
+                        test_url,
+                    );
+                    f.evidence    = Some(format!("Payload: {}", payload));
+                    f.remediation = Some("Validate and sanitize file paths; use allowlists instead of blocklists".to_string());
+                    findings.push(f);
+                    return findings;
                 }
             }
         }
@@ -311,7 +787,151 @@ async fn sqli_probe_param(
     findings
 }
 
-/// ⑤ 할당 없는 대소문자 무관 바이트 검색 (memchr 크레이트 없이 구현)
+/// Command injection probe: echo-based + time-based
+async fn cmdi_probe_param(
+    client: HttpClient,
+    scope: ScopeGuard,
+    url: String,
+    param_name: String,
+    original_query: Vec<(String, String)>,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+
+    // Echo-based
+    for (payload, marker) in CMDI_ECHO_PAYLOADS {
+        let Some(test_url) = inject_param(&url, &param_name, payload, &original_query, true)
+        else { continue };
+        if !scope.is_in_scope(&test_url) { continue; }
+
+        if let Ok(resp) = client.get(&test_url).await {
+            if memmem_find_icase(resp.body.as_bytes(), marker) {
+                debug!("CMDi echo at {} param={}", url, param_name);
+                let mut f = Finding::new(
+                    Severity::Critical,
+                    FindingCategory::CommandInjection,
+                    format!("Command Injection in parameter '{}'", param_name),
+                    format!("Echo marker '{}' reflected in response", std::str::from_utf8(marker).unwrap_or("?")),
+                    test_url,
+                );
+                f.evidence    = Some(format!("Payload: {}", payload));
+                f.remediation = Some("Never pass user input to shell commands; use safe APIs".to_string());
+                findings.push(f);
+                return findings;
+            }
+        }
+    }
+
+    // Time-based
+    for payload in CMDI_TIME_PAYLOADS {
+        let Some(test_url) = inject_param(&url, &param_name, payload, &original_query, true)
+        else { continue };
+        if !scope.is_in_scope(&test_url) { continue; }
+
+        if let Ok(resp) = client.get(&test_url).await {
+            if resp.elapsed_ms >= SQL_TIME_THRESHOLD_MS {
+                debug!("CMDi time-based at {} param={} ({}ms)", url, param_name, resp.elapsed_ms);
+                let mut f = Finding::new(
+                    Severity::Critical,
+                    FindingCategory::CommandInjection,
+                    format!("Command Injection (time-based) in parameter '{}'", param_name),
+                    format!("Response delayed {}ms with payload '{}'", resp.elapsed_ms, payload),
+                    test_url,
+                );
+                f.evidence    = Some(format!("Payload: {} | Elapsed: {}ms", payload, resp.elapsed_ms));
+                f.remediation = Some("Never pass user input to shell commands; use safe APIs".to_string());
+                findings.push(f);
+                return findings;
+            }
+        }
+    }
+
+    findings
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 403 Bypass: headers + path mutations (select_ok race)
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub async fn try_403_bypass(
+    client: &HttpClient,
+    url: &str,
+) -> Result<Option<HttpResponse>> {
+    type BoxFut = Pin<Box<dyn Future<Output = Result<HttpResponse>> + Send>>;
+
+    let mut futures: Vec<BoxFut> = Vec::new();
+
+    // Header-based bypass
+    for (k, v) in BYPASS_HEADERS {
+        let client = client.clone();
+        let url    = url.to_string();
+        let k      = *k;
+        let v      = *v;
+        futures.push(Box::pin(async move {
+            let resp = client.get_with_headers(&url, &[(k, v)]).await?;
+            if resp.status != 403 { Ok(resp) } else { Err(anyhow::anyhow!("still 403")) }
+        }));
+    }
+
+    // Path mutation bypass
+    let path_mutations: Vec<String> = generate_path_mutations(url);
+    for mutated_url in path_mutations {
+        let client = client.clone();
+        futures.push(Box::pin(async move {
+            let resp = client.get(&mutated_url).await?;
+            if resp.status != 403 { Ok(resp) } else { Err(anyhow::anyhow!("still 403")) }
+        }));
+    }
+
+    if futures.is_empty() {
+        return Ok(None);
+    }
+
+    match select_ok(futures).await {
+        Ok((resp, _remaining)) => {
+            debug!("403 bypass succeeded (status: {})", resp.status);
+            Ok(Some(resp))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+fn generate_path_mutations(url: &str) -> Vec<String> {
+    let mut mutations = Vec::new();
+    let Ok(parsed) = url::Url::parse(url) else { return mutations };
+    let path = parsed.path().to_string();
+    let base = format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or(""));
+
+    // Trailing slash
+    if !path.ends_with('/') {
+        mutations.push(format!("{}{}/", base, path));
+    }
+    // Double slash prefix
+    mutations.push(format!("{}/{}", base, path));
+    // Dot segment
+    mutations.push(format!("{}{}./", base, path));
+    // Case variation (capitalize first char after last /)
+    if let Some(pos) = path.rfind('/') {
+        let (prefix, suffix) = path.split_at(pos + 1);
+        if let Some(first_char) = suffix.chars().next() {
+            let toggled: String = std::iter::once(
+                if first_char.is_lowercase() { first_char.to_uppercase().next().unwrap() }
+                else { first_char.to_lowercase().next().unwrap() }
+            ).chain(suffix.chars().skip(1)).collect();
+            mutations.push(format!("{}{}{}", base, prefix, toggled));
+        }
+    }
+    // URL-encoded path
+    let encoded_path = path.replace('/', "%2f");
+    mutations.push(format!("{}/{}", base, encoded_path.trim_start_matches("%2f")));
+
+    mutations
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Utility
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Case-insensitive byte search without heap allocation
 fn memmem_find_icase(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || haystack.len() < needle.len() {
         return false;
@@ -324,41 +944,9 @@ fn memmem_find_icase(haystack: &[u8], needle: &[u8]) -> bool {
     })
 }
 
-/// ⑦ 403 bypass: 4개 헤더를 select_ok로 동시 발사
-pub async fn try_403_bypass(
-    client: &HttpClient,
-    url: &str,
-) -> Result<Option<HttpResponse>> {
-    type BoxFut = Pin<Box<dyn Future<Output = Result<HttpResponse>> + Send>>;
-
-    let futures: Vec<BoxFut> = BYPASS_HEADERS
-        .iter()
-        .map(|(k, v)| {
-            let client = client.clone();
-            let url    = url.to_string();
-            let k      = *k;
-            let v      = *v;
-            Box::pin(async move {
-                let resp = client.get_with_headers(&url, &[(k, v)]).await?;
-                if resp.status != 403 {
-                    Ok(resp)
-                } else {
-                    Err(anyhow::anyhow!("still 403"))
-                }
-            }) as BoxFut
-        })
-        .collect();
-
-    match select_ok(futures).await {
-        Ok((resp, _remaining)) => {
-            debug!("403 bypass succeeded (status: {})", resp.status);
-            Ok(Some(resp))
-        }
-        Err(_) => Ok(None),
-    }
-}
-
-use std::future::Future;
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -389,22 +977,63 @@ mod tests {
     #[tokio::test]
     async fn test_missing_security_headers_no_extra_request() {
         let server = MockServer::start().await;
-        // 정확히 1번만 응답 — 추가 GET이 오면 404
         Mock::given(method("GET"))
             .and(path("/"))
             .respond_with(ResponseTemplate::new(200).set_body_string("OK"))
-            .expect(1)   // ① 검증: 딱 1번만
+            .expect(1)
             .mount(&server)
             .await;
 
         let ctx    = make_ctx(&server.uri());
         let client = HttpClient::new(&ctx).unwrap();
-        let scope  = ScopeGuard::new("127.0.0.1");
-        // run() 내부에서 GET 1회만 나가야 함
-        let base = client.get(&server.uri()).await.unwrap();
+        let base   = client.get(&server.uri()).await.unwrap();
         let findings = check_security_headers(&base, &server.uri());
-        assert!(!findings.is_empty());
-        // MockServer verify: expect(1) 위반 시 패닉
+        // 6 required headers missing
+        assert!(findings.len() >= 6);
+    }
+
+    #[tokio::test]
+    async fn test_cors_wildcard() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("access-control-allow-origin", "*")
+                    .set_body_string("OK"),
+            )
+            .mount(&server)
+            .await;
+
+        let ctx    = make_ctx(&server.uri());
+        let client = HttpClient::new(&ctx).unwrap();
+        let base   = client.get(&server.uri()).await.unwrap();
+        let findings = check_cors(&base, &server.uri());
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].title.contains("wildcard"));
+    }
+
+    #[tokio::test]
+    async fn test_info_disclosure_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("server", "Apache/2.4.51")
+                    .insert_header("x-powered-by", "PHP/8.2")
+                    .insert_header("x-debug-token", "abc123")
+                    .set_body_string("OK"),
+            )
+            .mount(&server)
+            .await;
+
+        let ctx    = make_ctx(&server.uri());
+        let client = HttpClient::new(&ctx).unwrap();
+        let base   = client.get(&server.uri()).await.unwrap();
+        let findings = check_info_disclosure(&base, &server.uri());
+        // server version + x-powered-by + x-debug-token = 3
+        assert_eq!(findings.len(), 3);
     }
 
     #[tokio::test]
@@ -449,7 +1078,7 @@ mod tests {
                 ResponseTemplate::new(200)
                     .insert_header("set-cookie", "session=abc123; Path=/"),
             )
-            .expect(1)   // ① 검증
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -457,8 +1086,21 @@ mod tests {
         let client = HttpClient::new(&ctx).unwrap();
         let base   = client.get(&server.uri()).await.unwrap();
         let findings = check_cookies(&base, &server.uri());
-
-        // HttpOnly, SameSite 없으므로 최소 2개
         assert!(findings.len() >= 2);
+    }
+
+    #[test]
+    fn test_path_mutations() {
+        let mutations = generate_path_mutations("http://example.com/admin");
+        assert!(!mutations.is_empty());
+        assert!(mutations.iter().any(|m| m.ends_with('/')));
+    }
+
+    #[test]
+    fn test_inject_param() {
+        let query = vec![("id".to_string(), "1".to_string())];
+        let url = inject_param("http://example.com/?id=1", "id", "'", &query, false);
+        assert!(url.is_some());
+        assert!(url.unwrap().contains("id=%27"));
     }
 }

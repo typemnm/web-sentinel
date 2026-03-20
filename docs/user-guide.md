@@ -84,10 +84,13 @@ sentinel --target http://example.com
 
 이것만으로 아래가 자동 실행된다.
 - 공통 포트 29개 스캔
-- 기술 스택 핑거프린팅
+- 기술 스택 핑거프린팅 (14+ 패턴)
 - CVE 상관관계 분석
-- HTTP 취약점 점검 (헤더/SQLi/쿠키/리디렉션)
-- `scripts/` 디렉터리의 Lua 플러그인 전체 실행
+- HTTP 취약점 점검
+  - 보안 헤더 6종, CORS, 쿠키 보안, Mixed Content, 정보 유출 (패시브)
+  - SQLi (에러 기반 + Time-based blind), Path Traversal, Command Injection, CRLF Injection, Open Redirect (능동, 병렬)
+  - HTTP 메서드 검사, 403 Bypass (11개 기법)
+- `scripts/` 디렉터리의 Lua 플러그인 18개 병렬 실행
 
 결과는 `sentinel_report.json`에 저장된다.
 
@@ -292,7 +295,7 @@ local resp = http.get(TARGET .. "/admin")
 if resp.status == 200 then
     report.finding(
         "high",              -- 심각도: critical / high / medium / low / info
-        "custom",            -- 카테고리: xss / sqli / ssrf / traversal / custom
+        "custom",            -- 카테고리: xss / sqli / ssrf / traversal / cmdi / crlf / cors / custom
         "Exposed Admin Page",-- 제목
         "Admin page is accessible without authentication.",  -- 설명
         TARGET .. "/admin"   -- 취약한 URL
@@ -318,14 +321,59 @@ print(resp.body)                      -- "{"key":"val"}"
 print(resp.headers["content-type"])   -- "application/json"
 ```
 
+#### `http.post(url, body)`
+
+HTTP POST 요청을 수행한다 (Content-Type: application/x-www-form-urlencoded).
+
+```lua
+local resp = http.post(TARGET .. "/login", "username=admin&password=admin")
+print(resp.status)       -- 200 or 302
+print(resp.elapsed_ms)   -- 응답 시간 (ms)
+```
+
+#### `http.head(url)`
+
+HTTP HEAD 요청 — 바디를 수신하지 않아 빠른 존재 확인에 적합하다.
+
+```lua
+local resp = http.head(TARGET .. "/backup.zip")
+if resp.status == 200 then
+    -- 파일 존재 확인
+end
+```
+
+#### `http.get_with_headers(url, headers)`
+
+커스텀 헤더를 포함한 GET 요청. CORS, Host 헤더 인젝션 테스트에 사용.
+
+```lua
+local resp = http.get_with_headers(TARGET, {
+    ["Origin"] = "https://evil.com",
+    ["Host"] = "evil.com"
+})
+print(resp.headers["access-control-allow-origin"])
+```
+
+#### 응답 공통 필드
+
+모든 `http.*` 함수의 응답 테이블은 아래 필드를 포함한다.
+
+```lua
+resp.status       -- number  (HTTP 상태 코드)
+resp.body         -- string  (응답 본문, head는 빈 문자열)
+resp.headers      -- table   (헤더 키-값, 소문자)
+resp.url          -- string  (리디렉션 후 최종 URL)
+resp.elapsed_ms   -- number  (요청~응답 시간, 밀리초)
+```
+
 #### `report.finding(severity, category, title, description, url)`
 
 발견된 취약점을 리포트에 등록한다.
 
 ```lua
 report.finding(
-    "critical",           -- severity
-    "custom",             -- category
+    "critical",           -- severity: critical / high / medium / low / info
+    "custom",             -- category: xss / sqli / ssrf / traversal / cmdi / crlf / cors / custom
     "제목",               -- title
     "상세 설명",          -- description
     TARGET .. "/path"     -- url (선택, 생략 시 TARGET 사용)
@@ -472,7 +520,7 @@ jq '.summary' report.json
 ```bash
 make build        # 개발 빌드
 make release      # 릴리즈 빌드 (최적화 + strip)
-make test         # 전체 테스트 (22개)
+make test         # 전체 테스트 (26개)
 make lint         # clippy --deny warnings
 make fmt          # rustfmt 자동 포매팅
 make check        # fmt-check + lint + test

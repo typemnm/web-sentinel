@@ -98,6 +98,10 @@ pub enum FindingCategory {
     InsecureCookie,
     DirectoryTraversal,
     Ssrf,
+    CommandInjection,
+    CrlfInjection,
+    Cors,
+    InformationDisclosure,
     Custom,
 }
 

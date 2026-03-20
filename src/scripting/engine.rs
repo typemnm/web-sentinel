@@ -106,6 +106,21 @@ fn run_script_blocking(
         .unwrap())
 }
 
+/// Convert HttpResponse → Lua table (shared by all http.* functions)
+fn resp_to_lua_table(lua_ctx: &Lua, r: &crate::network::http::HttpResponse) -> mlua::Result<mlua::Value> {
+    let tbl = lua_ctx.create_table()?;
+    tbl.set("status", r.status)?;
+    tbl.set("body", r.body.clone())?;
+    tbl.set("url", r.url.clone())?;
+    tbl.set("elapsed_ms", r.elapsed_ms)?;
+    let hdrs = lua_ctx.create_table()?;
+    for (k, v) in &r.headers {
+        hdrs.set(k.clone(), v.clone())?;
+    }
+    tbl.set("headers", hdrs)?;
+    Ok(mlua::Value::Table(tbl))
+}
+
 fn setup_sandbox(
     lua: &Lua,
     target: &str,
@@ -120,35 +135,75 @@ fn setup_sandbox(
 
     lua_err!(globals.set("TARGET", target))?;
 
-    // --- http.get ---
-    let client_clone = client.clone();
-    let http_table   = lua_err!(lua.create_table())?;
+    let http_table = lua_err!(lua.create_table())?;
 
+    // --- http.get(url) ---
+    let client_get = client.clone();
     let get_fn = lua_err!(lua.create_function(move |lua_ctx, url: String| {
-        let client = client_clone.clone();
+        let client = client_get.clone();
         let resp = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                client.get(&url).await
-            })
+            tokio::runtime::Handle::current().block_on(client.get(&url))
         });
-
         match resp {
-            Ok(r) => {
-                let tbl = lua_ctx.create_table()?;
-                tbl.set("status", r.status)?;
-                tbl.set("body", r.body)?;
-                let hdrs = lua_ctx.create_table()?;
-                for (k, v) in r.headers {
-                    hdrs.set(k, v)?;
-                }
-                tbl.set("headers", hdrs)?;
-                Ok(mlua::Value::Table(tbl))
-            }
+            Ok(r) => resp_to_lua_table(&lua_ctx, &r),
             Err(e) => Err(mlua::Error::external(format!("http.get: {}", e))),
         }
     }))?;
-
     lua_err!(http_table.set("get", get_fn))?;
+
+    // --- http.post(url, body) ---
+    let client_post = client.clone();
+    let post_fn = lua_err!(lua.create_function(move |lua_ctx, (url, body): (String, String)| {
+        let client = client_post.clone();
+        let resp = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(client.post(&url, &body))
+        });
+        match resp {
+            Ok(r) => resp_to_lua_table(&lua_ctx, &r),
+            Err(e) => Err(mlua::Error::external(format!("http.post: {}", e))),
+        }
+    }))?;
+    lua_err!(http_table.set("post", post_fn))?;
+
+    // --- http.head(url) ---
+    let client_head = client.clone();
+    let head_fn = lua_err!(lua.create_function(move |lua_ctx, url: String| {
+        let client = client_head.clone();
+        let resp = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(client.head(&url))
+        });
+        match resp {
+            Ok(r) => resp_to_lua_table(&lua_ctx, &r),
+            Err(e) => Err(mlua::Error::external(format!("http.head: {}", e))),
+        }
+    }))?;
+    lua_err!(http_table.set("head", head_fn))?;
+
+    // --- http.get_with_headers(url, headers_table) ---
+    let client_gwh = client.clone();
+    let gwh_fn = lua_err!(lua.create_function(move |lua_ctx, (url, hdrs_tbl): (String, Table)| {
+        let client = client_gwh.clone();
+        // Convert Lua table to Vec of (String, String)
+        let mut extra: Vec<(String, String)> = Vec::new();
+        for pair in hdrs_tbl.pairs::<String, String>() {
+            if let Ok((k, v)) = pair {
+                extra.push((k, v));
+            }
+        }
+        let resp = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                // Convert to &str pairs for the API
+                let refs: Vec<(&str, &str)> = extra.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                client.get_with_headers(&url, &refs).await
+            })
+        });
+        match resp {
+            Ok(r) => resp_to_lua_table(&lua_ctx, &r),
+            Err(e) => Err(mlua::Error::external(format!("http.get_with_headers: {}", e))),
+        }
+    }))?;
+    lua_err!(http_table.set("get_with_headers", gwh_fn))?;
+
     lua_err!(globals.set("http", http_table))?;
 
     // --- report.finding ---
@@ -172,6 +227,9 @@ fn setup_sandbox(
                 "sqli" | "sql_injection"      => FindingCategory::SqlInjection,
                 "ssrf"                        => FindingCategory::Ssrf,
                 "traversal" | "dir_traversal" => FindingCategory::DirectoryTraversal,
+                "cmdi" | "command_injection"  => FindingCategory::CommandInjection,
+                "crlf"                        => FindingCategory::CrlfInjection,
+                "cors"                        => FindingCategory::Cors,
                 _                             => FindingCategory::Custom,
             };
 
@@ -183,7 +241,6 @@ fn setup_sandbox(
                 url.unwrap_or_else(|| target_str.clone()),
             );
 
-            // std::sync::Mutex — spawn_blocking 스레드 내에서 안전
             findings_ref.lock().unwrap().push(f);
             Ok(())
         },

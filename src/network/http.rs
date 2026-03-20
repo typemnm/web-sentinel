@@ -62,16 +62,17 @@ impl HttpClient {
         let mut last_err = None;
 
         for attempt in 0..3u8 {
-            // ⑩ try_clone().unwrap() 제거: 매번 새 RequestBuilder 생성
             let mut req = self.inner.get(url);
             for (k, v) in extra_headers {
                 req = req.header(*k, *v);
             }
 
+            let start = std::time::Instant::now();
             match req.send().await {
                 Ok(resp) => {
-                    debug!("GET {} -> {}", url, resp.status());
-                    return HttpResponse::from_reqwest(resp).await;
+                    let elapsed = start.elapsed();
+                    debug!("GET {} -> {} ({}ms)", url, resp.status(), elapsed.as_millis());
+                    return HttpResponse::from_reqwest(resp, elapsed).await;
                 }
                 Err(e) if attempt < 2 => {
                     last_err = Some(e);
@@ -84,18 +85,18 @@ impl HttpClient {
         Err(last_err.unwrap().into())
     }
 
-    /// ⑨ HEAD 요청: 헤더만 필요한 경우 바디 수신 생략
-    #[allow(dead_code)]
+    /// HEAD 요청: 헤더만 필요한 경우 바디 수신 생략
     pub async fn head(&self, url: &str) -> Result<HttpResponse> {
+        let start = std::time::Instant::now();
         let resp = self.inner
             .request(reqwest::Method::HEAD, url)
             .send()
             .await?;
-        HttpResponse::from_reqwest_headers_only(resp)
+        HttpResponse::from_reqwest_headers_only(resp, start.elapsed())
     }
 
-    #[allow(dead_code)]
     pub async fn post(&self, url: &str, body: &str) -> Result<HttpResponse> {
+        let start = std::time::Instant::now();
         let resp = self
             .inner
             .post(url)
@@ -103,7 +104,17 @@ impl HttpClient {
             .body(body.to_string())
             .send()
             .await?;
-        HttpResponse::from_reqwest(resp).await
+        HttpResponse::from_reqwest(resp, start.elapsed()).await
+    }
+
+    /// OPTIONS 요청: 허용된 HTTP 메서드 확인
+    pub async fn options(&self, url: &str) -> Result<HttpResponse> {
+        let start = std::time::Instant::now();
+        let resp = self.inner
+            .request(reqwest::Method::OPTIONS, url)
+            .send()
+            .await?;
+        HttpResponse::from_reqwest_headers_only(resp, start.elapsed())
     }
 }
 
@@ -114,32 +125,31 @@ pub struct HttpResponse {
     pub headers: HashMap<String, String>,
     pub body: String,
     pub url: String,
+    /// Response time in milliseconds (from request start to body received)
+    pub elapsed_ms: u64,
 }
 
 impl HttpResponse {
-    pub async fn from_reqwest(resp: Response) -> Result<Self> {
+    pub async fn from_reqwest(resp: Response, elapsed: std::time::Duration) -> Result<Self> {
         let url = resp.url().to_string();
         let status = resp.status().as_u16();
         let mut headers = HashMap::with_capacity(resp.headers().len());
         for (k, v) in resp.headers() {
-            // reqwest HeaderName은 이미 소문자 정규화 — ⑫ as_str() 사용
             headers.insert(k.as_str().to_string(), v.to_str().unwrap_or("").to_string());
         }
         let body = resp.text().await?;
-        Ok(Self { status, headers, body, url })
+        Ok(Self { status, headers, body, url, elapsed_ms: elapsed.as_millis() as u64 })
     }
 
     /// ⑨ 바디 수신 없이 헤더만 파싱
-    #[allow(dead_code)]
-    fn from_reqwest_headers_only(resp: Response) -> Result<Self> {
+    fn from_reqwest_headers_only(resp: Response, elapsed: std::time::Duration) -> Result<Self> {
         let url = resp.url().to_string();
         let status = resp.status().as_u16();
         let mut headers = HashMap::with_capacity(resp.headers().len());
         for (k, v) in resp.headers() {
             headers.insert(k.as_str().to_string(), v.to_str().unwrap_or("").to_string());
         }
-        // resp drop → 바디 수신 안 함
-        Ok(Self { status, headers, body: String::new(), url })
+        Ok(Self { status, headers, body: String::new(), url, elapsed_ms: elapsed.as_millis() as u64 })
     }
 }
 
