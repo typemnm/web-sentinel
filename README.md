@@ -249,6 +249,40 @@ make docker   # build Docker image
 
 ---
 
+## Contributing
+
+Extend Sentinel's detection coverage with Lua scripts — no Rust knowledge required.
+
+```lua
+-- scripts/your_check.lua
+local resp = http.get(TARGET .. "/secret-path")
+if resp.status == 200 and resp.body:find("sensitive_signature") then
+    report.finding("high", "custom", "Title", "Description", TARGET .. "/secret-path")
+end
+```
+
+Drop a `.lua` file into `scripts/` and it runs automatically — no recompilation needed.
+
+**Contribution workflow:**
+
+```
+Fork → Write scripts/your_check.lua → Test locally → Submit PR
+```
+
+**Scripts we'd love to have:**
+
+| Script | Detection | Difficulty |
+|--------|-----------|------------|
+| `xml_xxe.lua` | XXE Injection | Medium |
+| `firebase_misconfig.lua` | Firebase public DB | Easy |
+| `api_key_leak.lua` | API key patterns in responses | Easy |
+| `jwt_none_alg.lua` | JWT `alg: none` bypass | Medium |
+| `prototype_pollution.lua` | `__proto__` parameter injection | Medium |
+
+See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the full guide, PR checklist, and API reference.
+
+---
+
 ## Legal
 
 > **This tool is intended exclusively for use against systems you own or have explicit written authorization to test.**
@@ -261,9 +295,7 @@ make docker   # build Docker image
 
 ## License
 
-MIT © CERT Security Team
-
-See [LICENSE](LICENSE) for details.
+MIT License - see LICENSE file for details
 
 ---
 
@@ -271,3 +303,4 @@ See [LICENSE](LICENSE) for details.
 
 - [Overview](docs/overview.md) — Architecture, design principles, roadmap
 - [User Guide](docs/user-guide.md) — Installation, CLI reference, Lua API, troubleshooting
+- [Contributing](CONTRIBUTING.md) — Lua script contribution guide, PR checklist, wishlist
