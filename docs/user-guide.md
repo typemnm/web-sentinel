@@ -20,12 +20,12 @@ GitHub Releases 페이지에서 플랫폼에 맞는 바이너리를 다운로드
 
 ```bash
 # Linux AMD64
-curl -LO https://github.com/your-org/sentinel/releases/latest/download/sentinel-linux-amd64.tar.gz
+curl -LO https://github.com/typemnm/web-sentinel/releases/latest/download/sentinel-linux-amd64.tar.gz
 tar xzf sentinel-linux-amd64.tar.gz
 sudo mv sentinel /usr/local/bin/
 
 # macOS ARM64 (Apple Silicon)
-curl -LO https://github.com/your-org/sentinel/releases/latest/download/sentinel-macos-arm64.tar.gz
+curl -LO https://github.com/typemnm/web-sentinel/releases/latest/download/sentinel-macos-arm64.tar.gz
 tar xzf sentinel-macos-arm64.tar.gz
 sudo mv sentinel /usr/local/bin/
 ```
