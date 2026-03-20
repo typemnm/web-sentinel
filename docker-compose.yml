@@ -1,0 +1,22 @@
+version: "3.9"
+
+services:
+  sentinel:
+    build: .
+    image: sentinel:latest
+    volumes:
+      - ./output:/app/output        # scan results
+      - ./scripts:/app/scripts      # Lua scripts (hot-reload)
+    environment:
+      - RUST_LOG=info
+    # Usage: docker compose run sentinel --target https://example.com
+    # Override CMD entirely via `docker compose run sentinel <args>`
+    command: ["--help"]
+
+  # Convenience: run against a local DVWA/Juice Shop for testing
+  # docker compose --profile test up
+  juice-shop:
+    image: bkimminich/juice-shop
+    profiles: [test]
+    ports:
+      - "3000:3000"

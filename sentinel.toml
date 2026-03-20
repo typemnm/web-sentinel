@@ -1,0 +1,26 @@
+# Sentinel default configuration
+# Override via CLI flags or environment variables
+
+[scan]
+threads = 50
+rps = 10
+timeout = 10
+browser = false
+port_scan = true
+
+[output]
+file = "sentinel_report.json"
+format = "json"
+
+[http]
+user_agent = "Mozilla/5.0 (compatible; Sentinel/0.1.0)"
+follow_redirects = true
+max_redirects = 5
+
+[scope]
+# Domain is auto-set from --target
+# Add additional allowed domains here
+extra = []
+
+[scripts]
+dir = "scripts"

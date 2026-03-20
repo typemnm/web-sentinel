@@ -1,0 +1,82 @@
+[package]
+name = "sentinel"
+version = "0.1.0"
+edition = "2021"
+description = "Project Sentinel - CERT Web Vulnerability Scanner"
+authors = ["CERT Security Team"]
+license = "MIT"
+repository = "https://github.com/your-org/sentinel"
+keywords = ["security", "vulnerability-scanner", "web", "pentest", "cert"]
+categories = ["command-line-utilities", "network-programming"]
+rust-version = "1.75"
+
+[[bin]]
+name = "sentinel"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Config
+config = "0.14"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "cookies", "rustls-tls", "stream"], default-features = false }
+
+# Embedded databases
+sled = "0.34"
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Scripting (Lua)
+mlua = { version = "0.10", features = ["lua54", "vendored", "async", "serialize"] }
+
+# Rate limiting
+governor = "0.8"
+
+# Async helpers
+futures = "0.3"
+async-trait = "0.1"
+
+# UUID
+uuid = { version = "1", features = ["v4"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# URL parsing
+url = "2"
+
+# Regex
+regex = "1"
+
+# Headless browser
+headless_chrome = "1"
+
+[dev-dependencies]
+wiremock = "0.6"
+assert_cmd = "2"
+predicates = "3"
+tokio-test = "0.4"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
