@@ -92,6 +92,21 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Resolve scripts_dir: CWD-relative → binary-relative fallback
+    let scripts_dir = if cli.scripts_dir.exists() {
+        cli.scripts_dir.clone()
+    } else if let Ok(exe) = std::env::current_exe() {
+        let beside_bin = exe.parent().unwrap_or(exe.as_ref()).join(&cli.scripts_dir);
+        if beside_bin.exists() {
+            info!("Using scripts dir beside binary: {}", beside_bin.display());
+            beside_bin
+        } else {
+            cli.scripts_dir.clone()
+        }
+    } else {
+        cli.scripts_dir.clone()
+    };
+
     let scan_config = ScanConfig {
         target: target.clone(),
         output: cli.output.clone(),
@@ -99,7 +114,7 @@ async fn main() -> Result<()> {
         rps: cli.rps,
         silent: cli.silent,
         verbose: cli.verbose,
-        scripts_dir: cli.scripts_dir.clone(),
+        scripts_dir,
         config_path: cli.config.clone(),
         browser_enabled: cli.browser,
         port_scan_enabled: !cli.no_ports,

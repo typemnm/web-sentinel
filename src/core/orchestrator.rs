@@ -4,6 +4,7 @@ use tracing::{info, warn};
 use crate::core::scanner::{Finding, FindingCategory, ScanConfig, ScanContext, Severity};
 use crate::db::cve::CveDb;
 use crate::db::state::StateDb;
+use crate::network::crawler::Crawler;
 use crate::network::http::HttpClient;
 use crate::network::port::PortScanner;
 use crate::network::fingerprint::Fingerprinter;
@@ -80,6 +81,7 @@ impl Orchestrator {
         // Phase 3: CVE 상관관계 (fingerprint 결과 의존 → 직렬 유지)
         info!("[Phase 3] CVE correlation...");
         let cve_db = CveDb::open("sentinel_cves.db")?;
+        cve_db.seed_known_cves()?;
         for tech in &fp_result.technologies {
             if let Some(version) = &tech.version {
                 for cve in cve_db.search(&tech.name, version)? {
@@ -96,26 +98,49 @@ impl Orchestrator {
             }
         }
 
+        // Phase 3.5: Crawl — discover links and forms
+        info!("[Phase 3.5] Crawling target page for links and forms...");
+        let scope = ScopeGuard::new(&self.ctx.config.scope);
+        let crawler = Crawler::new(http_client.clone(), scope.clone());
+        let crawl_result = match crawler.crawl(&target).await {
+            Ok(cr) => {
+                info!(
+                    "Crawl complete: {} links, {} forms discovered",
+                    cr.urls.len(),
+                    cr.forms.len()
+                );
+                cr
+            }
+            Err(e) => {
+                warn!("Crawl failed: {:#}", e);
+                crate::network::crawler::CrawlResult::default()
+            }
+        };
+
         // ② Phase 4(HTTP 체크) + Phase 5(Lua) 동시 실행
         info!("[Phase 4+5] HTTP checks & Lua scripts in parallel...");
-        let scope   = ScopeGuard::new(&self.ctx.config.scope);
         let analyzer = ResponseAnalyzer::new(
             self.ctx.clone(), http_client.clone(), scope,
         );
 
-        let scripts_exist = self.ctx.config.scripts_dir.exists();
+        let scripts_dir   = self.ctx.config.scripts_dir.clone();
+        let scripts_exist = scripts_dir.exists();
         let ctx_clone     = self.ctx.clone();
         let client_clone  = http_client.clone();
         let target_clone  = target.clone();
 
+        let crawl_urls = crawl_result.urls.clone();
+        let crawl_forms = crawl_result.forms.clone();
+
         let (http_findings, script_findings) = tokio::join!(
-            analyzer.run(&target),
+            analyzer.run(&target, &crawl_urls, &crawl_forms),
             async move {
                 if scripts_exist {
                     let mut engine =
                         ScriptEngine::new(ctx_clone, client_clone).await?;
                     engine.run_all(&target_clone).await
                 } else {
+                    warn!("Scripts directory not found, skipping: {:?}", scripts_dir);
                     Ok(vec![])
                 }
             }

@@ -86,10 +86,14 @@ sentinel --target http://example.com
 - 공통 포트 29개 스캔
 - 기술 스택 핑거프린팅 (14+ 패턴)
 - CVE 상관관계 분석
+- 페이지 크롤링 (HTML 링크/폼 자동 발견)
 - HTTP 취약점 점검
-  - 보안 헤더 6종, CORS, 쿠키 보안, Mixed Content, 정보 유출 (패시브)
+  - 보안 헤더 6종, CORS, 쿠키 보안, Mixed Content, 정보 유출, 본문 패턴 분석 (패시브)
   - SQLi (에러 기반 + Time-based blind), Path Traversal, Command Injection, CRLF Injection, Open Redirect (능동, 병렬)
+  - 크롤링 발견 URL 인젝션 + 폼 POST/GET 인젝션
+  - param-less URL에 14개 공통 파라미터 추측 주입
   - HTTP 메서드 검사, 403 Bypass (11개 기법)
+- CVE 상관관계 분석 (19개 시드 CVE 내장, semver 비교)
 - `scripts/` 디렉터리의 Lua 플러그인 18개 병렬 실행
 
 결과는 `sentinel_report.json`에 저장된다.
@@ -520,7 +524,7 @@ jq '.summary' report.json
 ```bash
 make build        # 개발 빌드
 make release      # 릴리즈 빌드 (최적화 + strip)
-make test         # 전체 테스트 (26개)
+make test         # 전체 테스트 (31개)
 make lint         # clippy --deny warnings
 make fmt          # rustfmt 자동 포매팅
 make check        # fmt-check + lint + test

@@ -13,7 +13,7 @@ sentinel --target https://example.com
 ```
 [✓] Port Scan          — 29 common ports
 [✓] Tech Fingerprint   — WordPress 6.4 / PHP 8.2 / Nginx 1.24
-[✓] CVE Correlation    — CVE-2023-XXXX matched
+[✓] CVE Correlation    — 19 seeded CVEs, CVE-2024-34069 matched
 [✓] Security Headers   — 6 headers checked (CSP, HSTS, Referrer-Policy...)
 [✓] CORS               — Wildcard origin with credentials
 [✓] SQLi Detection     — Error-based + time-based blind
@@ -25,6 +25,9 @@ sentinel --target https://example.com
 [✓] 403 Bypass         — Headers + path mutations (11 techniques)
 [✓] HTTP Methods       — TRACE / PUT enabled
 [✓] Info Disclosure    — Server version, debug headers
+[✓] Page Crawler      — 3 links, 1 form discovered
+[✓] Form Injection    — SQLi in POST /login (field: username)
+[✓] Param Probing     — ?id=' triggers SQL error
 [✓] Lua Plugins (18)   — SSRF, SSTI, GraphQL, admin panels...
 [✓] DOM XSS            — alert() confirmed via headless Chrome
 
@@ -50,7 +53,7 @@ Report → sentinel_report.json
 | Category | What is checked | Severity |
 |----------|-----------------|----------|
 | **Tech Stack** | Web server, CMS, framework, language (14+ signatures) | Info |
-| **CVE** | Version-matched CVE lookup via embedded SQLite | High |
+| **CVE** | Version-matched CVE lookup — 19 pre-seeded CVEs (semver comparison) | High |
 | **Open Ports** | 29 common ports (TCP async connect) | Info |
 | **Security Headers** | X-Frame-Options, X-Content-Type-Options, HSTS (max-age), CSP, Referrer-Policy, Permissions-Policy | Low |
 | **CORS** | Wildcard origin, origin reflection, credentials leak | Medium–High |
@@ -64,6 +67,10 @@ Report → sentinel_report.json
 | **HTTP Methods** | TRACE / PUT / DELETE detection via OPTIONS | Medium |
 | **Info Disclosure** | Server version, X-Powered-By, debug headers (6 types) | Low |
 | **Mixed Content** | HTTP resources loaded on HTTPS pages | Medium |
+| **Page Crawler** | Auto-discover links + forms from HTML (scope-filtered) | — |
+| **Common Param Probing** | Guess `id`, `q`, `file`, `path` etc. on param-less URLs | High |
+| **Form Injection** | POST/GET form fields tested for SQLi + CMDi | High–Critical |
+| **Body Pattern Analysis** | HTML comments, hidden inputs, internal IPs, error traces | Low–Medium |
 | **DOM XSS** | `<script>`, `<img onerror>`, `<svg onload>` via headless Chrome | High |
 | **Reflected XSS** | URL parameter injection, JS alert() verified | High |
 | **Lua Plugins (18)** | SSRF, SSTI, GraphQL, admin panels, backup files, JS CVEs, and more | Varies |
@@ -194,8 +201,10 @@ flowchart TD
 
     ORC --> P3["Phase 3\nCVE Correlation\nSQLite"]
 
+    ORC --> P35["Phase 3.5\nHTML Crawler\nlinks + forms"]
+
     ORC --> P45["Phase 4+5 — parallel"]
-    P45 --> ANA["HTTP Analyzer\nSQLi / Traversal / CMDi / CRLF\nCORS / Methods / Headers"]
+    P45 --> ANA["HTTP Analyzer\nSQLi / Traversal / CMDi / CRLF\nCORS / Methods / Forms / Param Probe"]
     P45 --> LUA["Lua Engine\nspawn_blocking × N scripts"]
 
     ORC --> P6["Phase 6 (--browser)\nHeadless Chrome XSS"]
@@ -240,7 +249,7 @@ sys.exit(1) if hits > 0 else print('PASS')
 ## Development
 
 ```bash
-make test     # run 26 unit tests
+make test     # run 31 unit tests
 make check    # fmt + clippy + test
 make build    # debug build
 make release  # optimized release (lto + strip)

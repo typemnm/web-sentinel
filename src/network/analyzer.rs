@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 use tracing::{debug, warn};
 
 use crate::core::scanner::{Finding, FindingCategory, ScanContext, Severity};
+use crate::network::crawler::DiscoveredForm;
 use crate::network::http::{HttpClient, HttpResponse};
 use crate::network::scope::ScopeGuard;
 
@@ -120,6 +121,17 @@ static DANGEROUS_METHODS: &[&str] = &["TRACE", "PUT", "DELETE"];
 /// Mixed content regex (compiled once)
 static MIXED_CONTENT_RE: OnceLock<Regex> = OnceLock::new();
 
+/// Common parameter names to probe on param-less URLs
+static COMMON_PARAMS: &[&str] = &[
+    "id", "q", "search", "query", "page", "file", "path",
+    "name", "user", "cmd", "url", "input", "data", "lang",
+];
+
+/// Regexes for body pattern analysis
+static COMMENT_RE: OnceLock<Regex> = OnceLock::new();
+static INTERNAL_IP_RE: OnceLock<Regex> = OnceLock::new();
+static HIDDEN_INPUT_RE: OnceLock<Regex> = OnceLock::new();
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ResponseAnalyzer
 // ─────────────────────────────────────────────────────────────────────────────
@@ -135,20 +147,38 @@ impl ResponseAnalyzer {
         MIXED_CONTENT_RE.get_or_init(|| {
             Regex::new(r#"(?:src|href|action)\s*=\s*["']http://"#).unwrap()
         });
+        COMMENT_RE.get_or_init(|| Regex::new(r"(?s)<!--(.*?)-->").unwrap());
+        INTERNAL_IP_RE.get_or_init(|| {
+            Regex::new(
+                r"\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})\b",
+            )
+            .unwrap()
+        });
+        HIDDEN_INPUT_RE.get_or_init(|| {
+            Regex::new(r#"(?i)<input[^>]*type\s*=\s*["']hidden["'][^>]*>"#).unwrap()
+        });
         Self { ctx, client, scope }
     }
 
-    pub async fn run(&self, target: &str) -> Result<Vec<Finding>> {
+    pub async fn run(
+        &self,
+        target: &str,
+        discovered_urls: &[String],
+        forms: &[DiscoveredForm],
+    ) -> Result<Vec<Finding>> {
         if !self.scope.is_in_scope(target) {
             warn!("Target {} is out of scope, skipping", target);
             return Ok(vec![]);
         }
         debug!(
-            "Analyzer running against {} (timeout={}s)",
-            target, self.ctx.config.timeout_secs
+            "Analyzer running against {} (timeout={}s, +{} urls, +{} forms)",
+            target,
+            self.ctx.config.timeout_secs,
+            discovered_urls.len(),
+            forms.len()
         );
 
-        // ── Phase A: single GET, reused by all passive checks ───────────
+        // ── Phase A: passive checks on base response (0 extra requests) ─
         let base_resp = self.client.get(target).await?;
 
         let mut findings = Vec::new();
@@ -157,22 +187,29 @@ impl ResponseAnalyzer {
         findings.extend(check_cookies(&base_resp, target));
         findings.extend(check_mixed_content(&base_resp, target));
         findings.extend(check_info_disclosure(&base_resp, target));
+        findings.extend(check_body_patterns(&base_resp, target));
 
-        // ── Phase B: active injection checks (all parallel) ─────────────
-        let (sqli, traversal, cmdi, crlf, redirect) = tokio::join!(
-            self.check_sqli(target),
-            self.check_path_traversal(target),
-            self.check_cmdi(target),
-            self.check_crlf(target),
-            self.check_open_redirect(target),
+        // ── Phase B: active injection on target + discovered URLs ────────
+        // Collect all URLs for injection testing (cap at 20)
+        let mut injection_urls: Vec<String> = vec![target.to_string()];
+        injection_urls.extend(discovered_urls.iter().take(19).cloned());
+
+        let (inject_results, param_probe_results) = tokio::join!(
+            self.check_injections_multi(&injection_urls),
+            self.probe_common_params(&injection_urls),
         );
-        findings.extend(sqli?);
-        findings.extend(traversal?);
-        findings.extend(cmdi?);
-        findings.extend(crlf?);
-        findings.extend(redirect?);
+        findings.extend(inject_results?);
+        findings.extend(param_probe_results?);
 
-        // ── Phase C: special requests ───────────────────────────────────
+        // ── Phase B2: form POST/GET injection ────────────────────────────
+        for form in forms.iter().take(10) {
+            match self.check_form_injection(form).await {
+                Ok(f) => findings.extend(f),
+                Err(e) => warn!("Form injection error: {}", e),
+            }
+        }
+
+        // ── Phase C: special requests ────────────────────────────────────
         findings.extend(self.check_http_methods(target).await?);
 
         if base_resp.status == 403 {
@@ -191,6 +228,231 @@ impl ResponseAnalyzer {
                     "Enforce access control at application layer, not just middleware".to_string(),
                 );
                 findings.push(f);
+            }
+        }
+
+        Ok(findings)
+    }
+
+    /// Run injection checks (SQLi/Traversal/CMDi/CRLF/Redirect) on multiple URLs
+    async fn check_injections_multi(&self, urls: &[String]) -> Result<Vec<Finding>> {
+        let mut all_findings = Vec::new();
+
+        for url in urls {
+            let parsed = match url::Url::parse(url) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if parsed.query_pairs().count() == 0 {
+                continue; // param-less URLs handled by probe_common_params
+            }
+
+            let (sqli, traversal, cmdi, crlf, redirect) = tokio::join!(
+                self.check_sqli(url),
+                self.check_path_traversal(url),
+                self.check_cmdi(url),
+                self.check_crlf(url),
+                self.check_open_redirect(url),
+            );
+            all_findings.extend(sqli?);
+            all_findings.extend(traversal?);
+            all_findings.extend(cmdi?);
+            all_findings.extend(crlf?);
+            all_findings.extend(redirect?);
+        }
+
+        Ok(all_findings)
+    }
+
+    /// Probe common parameter names on param-less URLs
+    async fn probe_common_params(&self, urls: &[String]) -> Result<Vec<Finding>> {
+        let mut findings = Vec::new();
+
+        let paramless: Vec<&String> = urls
+            .iter()
+            .filter(|u| {
+                url::Url::parse(u)
+                    .map(|p| p.query_pairs().count() == 0)
+                    .unwrap_or(false)
+            })
+            .take(5)
+            .collect();
+
+        for url in paramless {
+            let base = url.trim_end_matches('/');
+            for param in COMMON_PARAMS {
+                // SQLi probe: single quote
+                let test_url = format!("{}?{}='", base, param);
+                if !self.scope.is_in_scope(&test_url) {
+                    continue;
+                }
+                if let Ok(resp) = self.client.get(&test_url).await {
+                    let body_bytes = resp.body.as_bytes();
+                    for sig in SQL_ERROR_SIGS {
+                        if memmem_find_icase(body_bytes, sig) {
+                            let mut f = Finding::new(
+                                Severity::High,
+                                FindingCategory::SqlInjection,
+                                format!("SQLi via discovered parameter '{}'", param),
+                                format!(
+                                    "SQL error '{}' with payload \"'\" on probed param '{}'",
+                                    std::str::from_utf8(sig).unwrap_or("?"),
+                                    param
+                                ),
+                                test_url.clone(),
+                            );
+                            f.evidence = Some(format!("Param: {}, Payload: '", param));
+                            f.remediation = Some(
+                                "Use parameterized queries / prepared statements".to_string(),
+                            );
+                            findings.push(f);
+                            break;
+                        }
+                    }
+                }
+
+                // Path traversal probe
+                let test_url = format!("{}?{}=../../etc/passwd", base, param);
+                if let Ok(resp) = self.client.get(&test_url).await {
+                    let body_bytes = resp.body.as_bytes();
+                    for sig in TRAVERSAL_SIGS {
+                        if memmem_find_icase(body_bytes, sig) {
+                            let mut f = Finding::new(
+                                Severity::High,
+                                FindingCategory::DirectoryTraversal,
+                                format!("Path Traversal via discovered parameter '{}'", param),
+                                format!(
+                                    "File content found with traversal payload on probed param '{}'",
+                                    param
+                                ),
+                                test_url.clone(),
+                            );
+                            f.evidence =
+                                Some(format!("Param: {}, Payload: ../../etc/passwd", param));
+                            f.remediation = Some(
+                                "Validate and sanitize file paths; use allowlists".to_string(),
+                            );
+                            findings.push(f);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(findings)
+    }
+
+    /// Test form fields for injection vulnerabilities
+    async fn check_form_injection(&self, form: &DiscoveredForm) -> Result<Vec<Finding>> {
+        let mut findings = Vec::new();
+        let sqli_payloads = &["'", "\"", "1' OR '1'='1"];
+
+        for (field_idx, (field_name, _)) in form.fields.iter().enumerate() {
+            // SQLi test
+            for payload in sqli_payloads {
+                let body = build_form_body(&form.fields, field_idx, payload);
+
+                let resp = if form.method == "POST" {
+                    self.client.post(&form.action, &body).await
+                } else {
+                    let url = format!("{}?{}", form.action.trim_end_matches('/'), body);
+                    self.client.get(&url).await
+                };
+
+                if let Ok(resp) = resp {
+                    let body_bytes = resp.body.as_bytes();
+                    for sig in SQL_ERROR_SIGS {
+                        if memmem_find_icase(body_bytes, sig) {
+                            let mut f = Finding::new(
+                                Severity::High,
+                                FindingCategory::SqlInjection,
+                                format!(
+                                    "SQLi in form field '{}' ({} {})",
+                                    field_name, form.method, form.action
+                                ),
+                                format!(
+                                    "SQL error '{}' found when injecting '{}' into form field '{}'",
+                                    std::str::from_utf8(sig).unwrap_or("?"),
+                                    payload,
+                                    field_name
+                                ),
+                                form.action.clone(),
+                            );
+                            f.evidence = Some(format!(
+                                "Method: {}, Field: {}, Payload: {}",
+                                form.method, field_name, payload
+                            ));
+                            f.remediation = Some(
+                                "Use parameterized queries / prepared statements".to_string(),
+                            );
+                            findings.push(f);
+                            return Ok(findings); // one finding per form
+                        }
+                    }
+
+                    // Time-based blind
+                    if resp.elapsed_ms >= SQL_TIME_THRESHOLD_MS {
+                        let mut f = Finding::new(
+                            Severity::High,
+                            FindingCategory::SqlInjection,
+                            format!(
+                                "Blind SQLi (time-based) in form field '{}' ({} {})",
+                                field_name, form.method, form.action
+                            ),
+                            format!(
+                                "Response delayed {}ms with payload '{}' in field '{}'",
+                                resp.elapsed_ms, payload, field_name
+                            ),
+                            form.action.clone(),
+                        );
+                        f.evidence = Some(format!(
+                            "Field: {}, Payload: {}, Elapsed: {}ms",
+                            field_name, payload, resp.elapsed_ms
+                        ));
+                        f.remediation =
+                            Some("Use parameterized queries / prepared statements".to_string());
+                        findings.push(f);
+                        return Ok(findings);
+                    }
+                }
+            }
+
+            // CMDi test on form fields
+            for (payload, marker) in CMDI_ECHO_PAYLOADS {
+                let body = build_form_body(&form.fields, field_idx, payload);
+                let resp = if form.method == "POST" {
+                    self.client.post(&form.action, &body).await
+                } else {
+                    let url = format!("{}?{}", form.action.trim_end_matches('/'), body);
+                    self.client.get(&url).await
+                };
+                if let Ok(resp) = resp {
+                    if memmem_find_icase(resp.body.as_bytes(), marker) {
+                        let mut f = Finding::new(
+                            Severity::Critical,
+                            FindingCategory::CommandInjection,
+                            format!(
+                                "Command Injection in form field '{}' ({} {})",
+                                field_name, form.method, form.action
+                            ),
+                            format!(
+                                "Echo marker reflected when injecting into form field '{}'",
+                                field_name
+                            ),
+                            form.action.clone(),
+                        );
+                        f.evidence = Some(format!(
+                            "Method: {}, Field: {}, Payload: {}",
+                            form.method, field_name, payload
+                        ));
+                        f.remediation = Some(
+                            "Never pass user input to shell commands; use safe APIs".to_string(),
+                        );
+                        findings.push(f);
+                        return Ok(findings);
+                    }
+                }
             }
         }
 
@@ -930,6 +1192,125 @@ fn generate_path_mutations(url: &str) -> Vec<String> {
 // ─────────────────────────────────────────────────────────────────────────────
 // Utility
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Build a form-encoded body string, injecting payload at field_idx
+fn build_form_body(fields: &[(String, String)], inject_idx: usize, payload: &str) -> String {
+    fields
+        .iter()
+        .enumerate()
+        .map(|(i, (name, value))| {
+            let val = if i == inject_idx { payload } else { value.as_str() };
+            format!("{}={}", simple_form_encode(name), simple_form_encode(val))
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Minimal form-encoding: only escape characters that break form structure
+fn simple_form_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("%26"),
+            '=' => out.push_str("%3D"),
+            '+' => out.push_str("%2B"),
+            '#' => out.push_str("%23"),
+            ' ' => out.push('+'),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Passive: detect sensitive patterns in HTML body (no extra requests)
+fn check_body_patterns(resp: &HttpResponse, url: &str) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let body = &resp.body;
+    let body_lower = body.to_lowercase();
+
+    // 1. HTML comments with sensitive keywords
+    let comment_re = COMMENT_RE.get().expect("initialized in new()");
+    let sensitive_words = [
+        "password", "passwd", "secret", "api_key", "apikey", "api-key",
+        "token", "todo", "fixme", "hack", "debug", "admin",
+    ];
+    for cap in comment_re.captures_iter(body) {
+        let comment = cap.get(1).unwrap().as_str().to_lowercase();
+        for word in &sensitive_words {
+            if comment.contains(word) {
+                let snippet = &cap[0];
+                let truncated = if snippet.len() > 150 {
+                    format!("{}...", &snippet[..150])
+                } else {
+                    snippet.to_string()
+                };
+                findings.push(Finding::new(
+                    Severity::Low,
+                    FindingCategory::InformationDisclosure,
+                    format!("HTML comment contains '{}'", word),
+                    format!("Sensitive keyword in comment: {}", truncated),
+                    url.to_string(),
+                ));
+                break;
+            }
+        }
+    }
+
+    // 2. Hidden inputs with suspicious names
+    let hidden_re = HIDDEN_INPUT_RE.get().expect("initialized in new()");
+    for cap in hidden_re.captures_iter(body) {
+        let input_lower = cap[0].to_lowercase();
+        let suspicious = ["debug", "role", "is_admin", "isadmin", "privilege", "internal"];
+        for keyword in &suspicious {
+            if input_lower.contains(keyword) {
+                findings.push(Finding::new(
+                    Severity::Medium,
+                    FindingCategory::InformationDisclosure,
+                    format!("Suspicious hidden input: '{}'", keyword),
+                    format!("Hidden field may expose internal state: {}", &cap[0]),
+                    url.to_string(),
+                ));
+                break;
+            }
+        }
+    }
+
+    // 3. Internal IP addresses in body
+    let ip_re = INTERNAL_IP_RE.get().expect("initialized in new()");
+    if ip_re.is_match(body) {
+        findings.push(Finding::new(
+            Severity::Low,
+            FindingCategory::InformationDisclosure,
+            "Internal IP address in response body",
+            "Response contains private IP address (10.x / 172.16-31.x / 192.168.x)",
+            url.to_string(),
+        ));
+    }
+
+    // 4. Error patterns in body (stack traces, debug output)
+    let error_patterns: &[(&str, &str)] = &[
+        ("traceback (most recent call last)", "Python traceback exposed"),
+        ("exception in thread", "Java exception exposed"),
+        ("fatal error:", "PHP fatal error exposed"),
+        ("syntax error", "Syntax error message exposed"),
+        ("unhandled exception", "Unhandled exception exposed"),
+        ("debug mode is on", "Debug mode is enabled"),
+        ("werkzeug debugger", "Werkzeug debugger is accessible"),
+    ];
+    for (pattern, desc) in error_patterns {
+        if body_lower.contains(pattern) {
+            findings.push(Finding::new(
+                Severity::Medium,
+                FindingCategory::InformationDisclosure,
+                desc.to_string(),
+                format!("Response body contains: '{}'", pattern),
+                url.to_string(),
+            ));
+        }
+    }
+
+    findings
+}
 
 /// Case-insensitive byte search without heap allocation
 fn memmem_find_icase(haystack: &[u8], needle: &[u8]) -> bool {

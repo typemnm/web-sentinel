@@ -135,10 +135,15 @@ Orchestrator::run()
     ├─ Phase 3: CVE 상관관계 분석
     │           (탐지된 기술 스택 → SQLite CVE DB 조회)
     │
+    ├─ Phase 3.5: 페이지 크롤링
+    │             (HTML 링크/폼 추출 → 스코프 필터 → discovered URLs/forms)
+    │
     ├─ [병렬] Phase 4 + Phase 5  ← tokio::join!
     │   ├─ Phase 4: HTTP 취약점 점검
-    │   │   ├─ [패시브] 보안 헤더 6종 / CORS / 쿠키 / Mixed Content / 정보 유출
+    │   │   ├─ [패시브] 보안 헤더 6종 / CORS / 쿠키 / Mixed Content / 정보 유출 / 본문 패턴
     │   │   ├─ [능동, 병렬] SQLi (에러+Blind) / Path Traversal / CMDi / CRLF / Open Redirect
+    │   │   ├─ [크롤 연동] 발견된 URL 파라미터 인젝션 + 폼 POST 인젝션
+    │   │   ├─ [파라미터 추측] param-less URL에 14개 공통 파라미터 프로빙
     │   │   ├─ HTTP Method 검사 (OPTIONS)
     │   │   └─ 403 Bypass (5개 헤더 + 6개 경로 변형, select_ok 경쟁)
     │   └─ Phase 5: Lua 스크립트 실행
@@ -162,6 +167,7 @@ tokio::main (multi_thread)
     │   │
     │   ├─ analyzer: tokio::join!(SQLi, Traversal, CMDi, CRLF, Redirect)
     │   │             select_ok(5헤더 + 6경로변형 403 bypass)
+    │   │             probe_common_params(14개) + check_form_injection(POST)
     │   │
     │   └─ engine:   spawn_blocking(Lua VM) × N 스크립트
     │
@@ -180,7 +186,7 @@ tokio::main (multi_thread)
 |----------|------|--------|
 | 기술 스택 | Apache, Nginx, IIS, WordPress, Drupal, Joomla, Laravel, Django, Spring, Express, PHP, ASP.NET | Info |
 | 데이터베이스 | MySQL, PostgreSQL 에러 노출 | Info |
-| CVE | 탐지된 기술 스택 버전 기반 CVE 매칭 | High |
+| CVE | 19개 시드 CVE 내장 + 기술 스택 버전 기반 semver 비교 | High |
 | 포트 | 21/22/23/25/53/80/443/3306/3389/5432/6379/8080 등 29개 | Info |
 | 보안 헤더 | X-Frame-Options, X-Content-Type-Options, HSTS (max-age 검증), CSP, Referrer-Policy, Permissions-Policy | Low |
 | CORS | 와일드카드 오리진(*), 오리진 반사, Credentials 조합 | Medium~High |
@@ -190,6 +196,10 @@ tokio::main (multi_thread)
 | CRLF Injection | `%0d%0a` 헤더 주입, 응답 헤더 반영 확인 | High |
 | 쿠키 | HttpOnly/Secure/SameSite 속성 누락 | Medium |
 | 오픈 리디렉션 | redirect/url/next/return/goto 등 7개 파라미터 | Medium |
+| 페이지 크롤링 | HTML 링크/폼 자동 발견 (스코프 필터) | — |
+| 공통 파라미터 프로빙 | param-less URL에 id/q/file/path 등 14개 파라미터 추측 주입 | High |
+| 폼 인젝션 | POST/GET 폼 필드 SQLi + CMDi 테스트 | High~Critical |
+| 본문 패턴 분석 | HTML 주석, hidden input, 내부 IP, 에러 트레이스 탐지 | Low~Medium |
 | XSS (DOM) | `<script>`, `<img onerror>`, `<svg onload>` 등 | High |
 | XSS (Reflected) | URL 파라미터를 통한 JS 실행 확인 | High |
 | 403 Bypass | 5개 우회 헤더 + 6개 경로 변형 (대소문자, URL 인코딩, dot segment 등) | Medium |
@@ -380,17 +390,15 @@ loadfile→ nil
 
 ### 현재 한계
 
-- CVE DB가 비어 있음 — NVD/MITRE 데이터 임포트 스크립트 미구현
 - 인증 세션 처리 없음 (로그인 후 스캔 불가)
-- 크롤링 미구현 (단일 URL만 분석, 링크 추적 없음)
 - XXE 탐지 플러그인 미제공 (Lua로 확장 가능)
 
 ### 향후 로드맵
 
 | 우선순위 | 항목 |
 |----------|------|
-| 높음 | NVD JSON 피드 임포트 (`sentinel import-cve`) |
-| 높음 | 재귀 크롤러 (robots.txt 준수) |
+| 높음 | 재귀 크롤러 확장 (멀티 레벨 링크 추적, robots.txt 준수) |
+| 중간 | NVD JSON 피드 임포트 (`sentinel import-cve`) |
 | 중간 | 인증 세션 지원 (`--cookie`, `--auth-header`) |
 | 중간 | XXE Lua 플러그인 추가 |
 | 낮음 | HTML 리포트 출력 |
