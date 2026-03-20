@@ -1,1 +1,20 @@
+# Build
 /target
+
+# Runtime databases
+sentinel_state.db/
+sentinel_cves.db
+
+# Scan output
+sentinel_report.json
+output/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
