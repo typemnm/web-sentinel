@@ -198,6 +198,7 @@ end
 |------|------|------|
 | `http.get(url)` | GET 요청 | 응답 테이블 |
 | `http.post(url, body)` | POST 요청 (form-urlencoded) | 응답 테이블 |
+| `http.post_json(url, body)` | POST 요청 (application/json) | 응답 테이블 |
 | `http.head(url)` | HEAD 요청 (바디 없음) | 응답 테이블 |
 | `http.get_with_headers(url, {k=v})` | 커스텀 헤더 GET | 응답 테이블 |
 | `report.finding(sev, cat, title, desc, url)` | 취약점 보고 | - |
@@ -221,17 +222,16 @@ end
 
 | 스크립트 | 설명 | 난이도 |
 |----------|------|--------|
-| `xml_xxe.lua` | XML 외부 엔티티 인젝션 탐지 | 중간 |
 | `firebase_misconfig.lua` | Firebase Realtime DB `.json` 접근 | 낮음 |
 | `s3_bucket_enum.lua` | S3 버킷 공개 접근 탐지 | 낮음 |
 | `api_key_leak.lua` | 응답에서 API 키/토큰 패턴 탐지 | 낮음 |
-| `jwt_none_alg.lua` | JWT `alg: none` 취약점 | 중간 |
 | `websocket_check.lua` | WebSocket 인증 없는 접근 | 중간 |
 | `cache_poisoning.lua` | 웹 캐시 포이즈닝 탐지 | 높음 |
-| `prototype_pollution.lua` | `__proto__` 파라미터 주입 | 중간 |
 | `subdomain_takeover.lua` | CNAME 댕글링 탐지 | 높음 |
 | `open_redirect_advanced.lua` | 고급 오픈 리디렉트 (인코딩 우회) | 중간 |
 
+> **이미 내장된 스크립트 (28개)**: JWT 취약점, XXE 인젝션, 프로토타입 폴루션, NoSQL 인젝션, SSRF, SSTI, IDOR, 역직렬화, 파일 업로드 우회, GraphQL 인트로스펙션, 디버그 엔드포인트, WordPress 설정 백업, robots.txt, 백업 파일, 관리자 패널, 소스맵, CORS 리플렉션, Host 헤더 인젝션, .htaccess/.htpasswd, 정보 유출, 에러 페이지, JSONP 콜백, 취약한 JS 라이브러리, .git 노출, .env 노출 등.
+>
 > Issue에 `script-idea` 라벨로 새 아이디어를 제안할 수도 있습니다.
 
 ---
@@ -306,11 +306,19 @@ Rust 코어 엔진에 기여하려면 아래 구조를 이해해야 합니다.
 
 ```
 src/
-├── core/scanner.rs       # Finding, FindingCategory 타입 정의
+├── core/
+│   ├── scanner.rs        # Finding, FindingCategory, ScanConfig 타입 정의
+│   └── orchestrator.rs   # 6-phase 스캔 파이프라인 + Finding 중복 제거 + 기술→취약점 연계
 ├── network/
-│   ├── http.rs           # HttpClient 래퍼 (elapsed_ms 포함)
-│   ├── analyzer.rs       # 3-phase 취약점 분석 (패시브 → 능동 → 스페셜)
+│   ├── http.rs           # HttpClient (governor 레이트리미터, 인증, elapsed_ms)
+│   ├── analyzer.rs       # 취약점 분석 (패시브 → 능동 → 스페셜, 베이스라인 기반)
+│   ├── crawler.rs        # 재귀 크롤러 (BFS + JS 엔드포인트 추출)
+│   ├── evasion.rs        # WAF 우회 전략 (fast 3종 / thorough 9종)
 │   └── ...
+├── report/
+│   └── dedup.rs          # Finding 중복 제거 + 크로스 URL 집계
+├── browser/
+│   └── xss.rs            # 헤드리스 Chrome XSS (MutationObserver + 폴리글롯)
 └── scripting/engine.rs   # Lua VM, 샌드박스, http/report API 바인딩
 ```
 

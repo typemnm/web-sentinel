@@ -163,13 +163,26 @@ fn build_patterns() -> Vec<FingerprintPattern> {
     add_pattern!("Laravel", "Framework",
         headers: [], body: [r"laravel_session|XSRF-TOKEN"]);
     add_pattern!("Django", "Framework",
-        headers: ["x-frame-options" => r"SAMEORIGIN"],
-        body: [r"csrfmiddlewaretoken"]);
+        headers: [],
+        body: [r"csrfmiddlewaretoken", r"django\.contrib|__django_"]);
     add_pattern!("Spring", "Framework",
         headers: ["x-application-context" => r".*"],
         body: [r#"Whitelabel Error Page|Spring Framework"#]);
     add_pattern!("Express", "Framework",
         headers: ["x-powered-by" => r"Express"], body: []);
+
+    add_pattern!("Flask", "Framework",
+        headers: [],
+        body: [r"Werkzeug|flask\.pocoo\.org|flask_"]);
+    add_pattern!("Angular", "Framework",
+        headers: [],
+        body: [r"ng-version=|ng-app|angular\.min\.js|ng-controller"]);
+    add_pattern!("React", "Framework",
+        headers: [],
+        body: [r"react\.production\.min\.js|data-reactroot|_reactRootContainer"]);
+    add_pattern!("Vue.js", "Framework",
+        headers: [],
+        body: [r"vue\.min\.js|vue\.runtime|v-cloak|__vue__"]);
 
     // Languages
     add_pattern!("PHP", "Language",

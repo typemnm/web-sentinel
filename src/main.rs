@@ -11,7 +11,7 @@ mod report;
 mod scripting;
 
 use crate::core::orchestrator::Orchestrator;
-use crate::core::scanner::ScanConfig;
+use crate::core::scanner::{AuthMethod, ScanConfig};
 
 /// Project Sentinel - CERT Web Vulnerability Scanner
 #[derive(Parser, Debug)]
@@ -73,6 +73,34 @@ pub struct Cli {
     /// User-Agent string override
     #[arg(long)]
     pub user_agent: Option<String>,
+
+    /// Authentication cookie (e.g. "session=abc123; token=xyz")
+    #[arg(long, env = "SENTINEL_COOKIE")]
+    pub cookie: Option<String>,
+
+    /// Bearer token for Authorization header
+    #[arg(long, env = "SENTINEL_TOKEN")]
+    pub token: Option<String>,
+
+    /// Basic auth credentials (format: "username:password")
+    #[arg(long, env = "SENTINEL_BASIC_AUTH")]
+    pub basic_auth: Option<String>,
+
+    /// Custom auth header (format: "Header-Name:value")
+    #[arg(long, env = "SENTINEL_AUTH_HEADER")]
+    pub auth_header: Option<String>,
+
+    /// Maximum crawl depth for recursive link discovery
+    #[arg(long, default_value = "3")]
+    pub crawl_depth: usize,
+
+    /// Maximum number of URLs to visit during crawling
+    #[arg(long, default_value = "100")]
+    pub crawl_max_urls: usize,
+
+    /// Thorough scan mode: more evasion variants, deeper checks (slower)
+    #[arg(long)]
+    pub thorough: bool,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -107,6 +135,31 @@ async fn main() -> Result<()> {
         cli.scripts_dir.clone()
     };
 
+    // Resolve authentication method from CLI args (priority: cookie > token > basic > header)
+    let auth = if let Some(cookie) = cli.cookie {
+        AuthMethod::Cookie(cookie)
+    } else if let Some(token) = cli.token {
+        AuthMethod::Bearer(token)
+    } else if let Some(basic) = cli.basic_auth {
+        let parts: Vec<&str> = basic.splitn(2, ':').collect();
+        if parts.len() == 2 {
+            AuthMethod::Basic(parts[0].to_string(), parts[1].to_string())
+        } else {
+            eprintln!("Error: --basic-auth must be in format 'username:password'");
+            std::process::exit(1);
+        }
+    } else if let Some(header) = cli.auth_header {
+        let parts: Vec<&str> = header.splitn(2, ':').collect();
+        if parts.len() == 2 {
+            AuthMethod::CustomHeader(parts[0].to_string(), parts[1].trim().to_string())
+        } else {
+            eprintln!("Error: --auth-header must be in format 'Header-Name:value'");
+            std::process::exit(1);
+        }
+    } else {
+        AuthMethod::None
+    };
+
     let scan_config = ScanConfig {
         target: target.clone(),
         output: cli.output.clone(),
@@ -121,6 +174,10 @@ async fn main() -> Result<()> {
         scope: cli.scope.unwrap_or(target),
         timeout_secs: cli.timeout,
         user_agent: cli.user_agent.clone(),
+        auth,
+        max_crawl_depth: cli.crawl_depth,
+        max_crawl_urls: cli.crawl_max_urls,
+        thorough: cli.thorough,
     };
 
     let mut orchestrator = Orchestrator::new(scan_config).await?;

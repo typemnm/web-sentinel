@@ -1,10 +1,13 @@
 use anyhow::Result;
+use governor::{Quota, RateLimiter};
 use reqwest::{Client, Response, header};
 use std::collections::HashMap;
+use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug;
 
-use crate::core::scanner::ScanContext;
+use crate::core::scanner::{AuthMethod, ScanContext};
 
 const DEFAULT_UA: &str = concat!(
     "Mozilla/5.0 (compatible; Sentinel/",
@@ -20,9 +23,17 @@ static USER_AGENTS: &[&str] = &[
     DEFAULT_UA,
 ];
 
+type GovernorLimiter = RateLimiter<
+    governor::state::NotKeyed,
+    governor::state::InMemoryState,
+    governor::clock::DefaultClock,
+>;
+
 #[derive(Clone)]
 pub struct HttpClient {
     inner: Client,
+    auth: AuthMethod,
+    rate_limiter: Arc<GovernorLimiter>,
 }
 
 impl HttpClient {
@@ -46,7 +57,27 @@ impl HttpClient {
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()?;
 
-        Ok(Self { inner: client })
+        let rps = ctx.config.rps.max(1);
+        let quota = Quota::per_second(NonZeroU32::new(rps).unwrap());
+        let rate_limiter = Arc::new(RateLimiter::direct(quota));
+
+        Ok(Self { inner: client, auth: ctx.config.auth.clone(), rate_limiter })
+    }
+
+    /// Wait until rate limiter allows a request
+    async fn wait_rate_limit(&self) {
+        self.rate_limiter.until_ready().await;
+    }
+
+    /// Apply configured authentication to a request builder
+    fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.auth {
+            AuthMethod::None => req,
+            AuthMethod::Cookie(cookie) => req.header(header::COOKIE, cookie),
+            AuthMethod::Bearer(token) => req.bearer_auth(token),
+            AuthMethod::Basic(user, pass) => req.basic_auth(user, Some(pass)),
+            AuthMethod::CustomHeader(name, value) => req.header(name.as_str(), value.as_str()),
+        }
     }
 
     /// GET with automatic retry — ⑩ try_clone 제거, 매 재시도마다 빌더 재구성
@@ -62,7 +93,8 @@ impl HttpClient {
         let mut last_err = None;
 
         for attempt in 0..3u8 {
-            let mut req = self.inner.get(url);
+            self.wait_rate_limit().await;
+            let mut req = self.apply_auth(self.inner.get(url));
             for (k, v) in extra_headers {
                 req = req.header(*k, *v);
             }
@@ -87,19 +119,19 @@ impl HttpClient {
 
     /// HEAD 요청: 헤더만 필요한 경우 바디 수신 생략
     pub async fn head(&self, url: &str) -> Result<HttpResponse> {
+        self.wait_rate_limit().await;
         let start = std::time::Instant::now();
-        let resp = self.inner
-            .request(reqwest::Method::HEAD, url)
+        let resp = self.apply_auth(self.inner.request(reqwest::Method::HEAD, url))
             .send()
             .await?;
         HttpResponse::from_reqwest_headers_only(resp, start.elapsed())
     }
 
     pub async fn post(&self, url: &str, body: &str) -> Result<HttpResponse> {
+        self.wait_rate_limit().await;
         let start = std::time::Instant::now();
         let resp = self
-            .inner
-            .post(url)
+            .apply_auth(self.inner.post(url))
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(body.to_string())
             .send()
@@ -107,11 +139,38 @@ impl HttpClient {
         HttpResponse::from_reqwest(resp, start.elapsed()).await
     }
 
+    /// POST with JSON content-type body — for REST API injection testing
+    pub async fn post_json(&self, url: &str, json_body: &str) -> Result<HttpResponse> {
+        self.wait_rate_limit().await;
+        let start = std::time::Instant::now();
+        let resp = self
+            .apply_auth(self.inner.post(url))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body.to_string())
+            .send()
+            .await?;
+        HttpResponse::from_reqwest(resp, start.elapsed()).await
+    }
+
+    /// GET without following redirects — for detecting open redirect via Location header
+    pub async fn get_no_redirect(&self, url: &str) -> Result<HttpResponse> {
+        self.wait_rate_limit().await;
+        let no_redirect_client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let req = self.apply_auth(no_redirect_client.get(url));
+        let start = std::time::Instant::now();
+        let resp = req.send().await?;
+        let elapsed = start.elapsed();
+        HttpResponse::from_reqwest(resp, elapsed).await
+    }
+
     /// OPTIONS 요청: 허용된 HTTP 메서드 확인
     pub async fn options(&self, url: &str) -> Result<HttpResponse> {
+        self.wait_rate_limit().await;
         let start = std::time::Instant::now();
-        let resp = self.inner
-            .request(reqwest::Method::OPTIONS, url)
+        let resp = self.apply_auth(self.inner.request(reqwest::Method::OPTIONS, url))
             .send()
             .await?;
         HttpResponse::from_reqwest_headers_only(resp, start.elapsed())
@@ -174,6 +233,10 @@ mod tests {
             scope: "example.com".to_string(),
             timeout_secs: 10,
             user_agent: None,
+            auth: crate::core::scanner::AuthMethod::default(),
+            max_crawl_depth: 3,
+            max_crawl_urls: 100,
+            thorough: false,
         })
     }
 
@@ -190,6 +253,10 @@ mod tests {
             browser_enabled: false, port_scan_enabled: false,
             scope: "example.com".to_string(),
             timeout_secs: 10, user_agent: None,
+            auth: crate::core::scanner::AuthMethod::default(),
+            max_crawl_depth: 3,
+            max_crawl_urls: 100,
+            thorough: false,
         });
         let client = HttpClient::new(&ctx);
         assert!(client.is_ok());

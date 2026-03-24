@@ -84,19 +84,21 @@ sentinel --target http://example.com
 
 이것만으로 아래가 자동 실행된다.
 - 공통 포트 29개 스캔
-- 기술 스택 핑거프린팅 (14+ 패턴)
-- CVE 상관관계 분석
-- 페이지 크롤링 (HTML 링크/폼 자동 발견)
+- 기술 스택 핑거프린팅 (18+ 패턴: Angular, React, Vue.js, Flask 포함)
+- CVE 상관관계 분석 (19개 시드 CVE 내장, semver 비교)
+- 재귀 크롤링 (BFS, depth 3, 최대 100 URL + JS 엔드포인트 추출 + SPA `<script src>` 번들 파싱)
 - HTTP 취약점 점검
   - 보안 헤더 6종, CORS, 쿠키 보안, Mixed Content, 정보 유출, 본문 패턴 분석 (패시브)
-  - SQLi (에러 기반 + Time-based blind), Path Traversal, Command Injection, CRLF Injection, Open Redirect (능동, 병렬)
-  - 크롤링 발견 URL 인젝션 + 폼 POST/GET 인젝션
-  - param-less URL에 14개 공통 파라미터 추측 주입
+  - SQLi (에러 기반 + Time-based blind 베이스라인 기반), Path Traversal (16종 페이로드), Command Injection, SSTI (6 엔진), CRLF Injection, Open Redirect (능동, 병렬)
+  - WAF evasion 적용 (fast 3종 기본, --thorough 시 9종)
+  - 크롤링 발견 URL 인젝션 + 폼 POST/GET 인젝션 (병렬)
+  - param-less URL에 14개 공통 + 12개 SSTI 파라미터 추측 주입
   - HTTP 메서드 검사, 403 Bypass (11개 기법)
-- CVE 상관관계 분석 (19개 시드 CVE 내장, semver 비교)
-- `scripts/` 디렉터리의 Lua 플러그인 18개 병렬 실행
+- `scripts/` 디렉터리의 Lua 플러그인 28개 병렬 실행 (SPA 오탐 방지 로직 내장)
+- Finding 중복 제거 (동일 URL 병합 + 크로스 URL 집계)
+- 레이트 리미팅 (governor 기반 --rps 강제)
 
-결과는 `sentinel_report.json`에 저장된다.
+결과는 `sentinel_report.json`에 저장된다 (심각도순 정렬).
 
 ### 브라우저 포함 전체 스캔 (XSS 포함)
 
@@ -129,7 +131,7 @@ Options:
   -t, --target <TARGET>         스캔 대상 도메인 또는 URL
   -o, --output <OUTPUT>         JSON 리포트 저장 경로 [기본: sentinel_report.json]
       --threads <N>             동시 작업 수 [기본: 50]
-      --rps <N>                 초당 최대 요청 수 [기본: 10]
+      --rps <N>                 초당 최대 요청 수 (governor 레이트리미터) [기본: 10]
   -s, --silent                  경고 이상만 출력
   -v, --verbose                 상세 로그 (-v: debug, -vv: trace)
       --scripts-dir <DIR>       Lua 스크립트 디렉터리 [기본: scripts]
@@ -139,6 +141,13 @@ Options:
       --scope <DOMAIN>          허용 스코프 도메인 (기본: --target에서 자동 추출)
       --timeout <SEC>           요청 타임아웃 (초) [기본: 10]
       --user-agent <UA>         User-Agent 오버라이드
+      --thorough                전수 모드: 9개 WAF evasion 변환 (느리지만 깊은 검사)
+      --crawl-depth <N>         재귀 크롤링 최대 깊이 [기본: 3]
+      --crawl-max-urls <N>      크롤링 시 방문할 최대 URL 수 [기본: 100]
+      --cookie <COOKIE>         인증 쿠키 (예: "session=abc123; csrf=xyz")
+      --token <TOKEN>           Bearer 토큰 (Authorization: Bearer)
+      --basic-auth <U:P>        Basic 인증 자격증명 ("user:pass")
+      --auth-header <H:V>       커스텀 인증 헤더 ("X-API-Key:value")
   -h, --help                    도움말 출력
   -V, --version                 버전 출력
 ```
@@ -155,10 +164,15 @@ Options:
 | `SENTINEL_RPS` | `--rps` |
 | `SENTINEL_SCRIPTS` | `--scripts-dir` |
 | `SENTINEL_CONFIG` | `--config` |
+| `SENTINEL_COOKIE` | `--cookie` |
+| `SENTINEL_TOKEN` | `--token` |
+| `SENTINEL_BASIC_AUTH` | `--basic-auth` |
+| `SENTINEL_AUTH_HEADER` | `--auth-header` |
 
 ```bash
 export SENTINEL_TARGET=http://testsite.local
 export SENTINEL_RPS=5
+export SENTINEL_COOKIE="session=abc123"
 sentinel
 ```
 
@@ -181,7 +195,7 @@ file = "sentinel_report.json"
 format = "json"
 
 [http]
-user_agent = "Mozilla/5.0 (compatible; Sentinel/0.1.0)"
+user_agent = "Mozilla/5.0 (compatible; Sentinel/0.1.1)"
 follow_redirects = true
 max_redirects = 5
 
@@ -281,6 +295,82 @@ sentinel \
   --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120"
 ```
 
+### 시나리오 7: 인증된 스캔 (로그인 후 영역 점검)
+
+```bash
+# 쿠키 인증 (세션 쿠키 + CSRF 토큰)
+sentinel \
+  --target https://app.example.com \
+  --cookie "session=abc123; csrf=xyz789" \
+  --no-ports
+
+# Bearer 토큰 인증 (API 서버)
+sentinel \
+  --target https://api.example.com \
+  --token "eyJhbGciOi..." \
+  --rps 5
+
+# Basic 인증
+sentinel \
+  --target https://staging.example.com \
+  --basic-auth "admin:password123"
+
+# 커스텀 헤더 인증 (API 키)
+sentinel \
+  --target https://api.example.com \
+  --auth-header "X-API-Key:sk-1234567890"
+```
+
+인증 정보는 크롤링, Lua 스크립트 등 모든 HTTP 요청에 자동으로 적용된다.
+
+### 시나리오 8: 전수 모드 (WAF 우회 강화)
+
+```bash
+sentinel \
+  --target https://target.com \
+  --thorough \
+  --rps 3 \
+  -vv
+```
+
+`--thorough` 모드는 9개 WAF evasion 전략을 모두 적용한다 (기본: fast 3종).
+evasion 전략: double URL encode, unicode overlong, case mixing, inline comment, hex encode, char bypass, HTML entity, whitespace substitution, combined.
+
+### 시나리오 9: 심층 크롤링 (대규모 사이트)
+
+```bash
+sentinel \
+  --target https://large-site.com \
+  --crawl-depth 5 \
+  --crawl-max-urls 500 \
+  --browser \
+  --rps 10
+```
+
+기본값은 depth 3 / 최대 100 URL이다. 대규모 사이트에서는 값을 높여 더 많은 페이지를 점검할 수 있다.
+
+### 시나리오 10: SPA (Single Page Application) 스캔
+
+Angular, React, Vue.js 등 SPA는 서버사이드 라우팅이 없어 일반 크롤러로는 API 엔드포인트를 발견하기 어렵다. Sentinel v0.1.1은 SPA에 최적화된 스캔을 제공한다.
+
+```bash
+sentinel \
+  --target http://spa-app.local \
+  --crawl-depth 4 \
+  --crawl-max-urls 200 \
+  --thorough \
+  --no-ports \
+  --rps 20
+```
+
+**SPA 스캔 동작:**
+- `<script src>` 태그에서 JS 번들 파일을 추출하고, 번들 내 API 경로 (`/api/`, `/rest/`, `/v1/` 등)를 자동 발견
+- `fetch()`, `axios`, `XMLHttpRequest` 호출에서 URL 패턴 추출
+- Lua 플러그인이 SPA 쉘(모든 경로에 200+HTML 반환)을 감지하여 백업 파일, .htaccess 등의 오탐 자동 제거
+- SSTI 탐지 시 베이스라인 체크로 페이지에 자연 존재하는 숫자와의 오탐 방지
+
+**팁:** SPA 대상에서는 `--crawl-max-urls`을 200 이상으로 설정하면 JS 번들에서 더 많은 엔드포인트를 수집할 수 있다.
+
 ---
 
 ## 6. Lua 플러그인 작성 가이드
@@ -333,6 +423,16 @@ HTTP POST 요청을 수행한다 (Content-Type: application/x-www-form-urlencode
 local resp = http.post(TARGET .. "/login", "username=admin&password=admin")
 print(resp.status)       -- 200 or 302
 print(resp.elapsed_ms)   -- 응답 시간 (ms)
+```
+
+#### `http.post_json(url, body)`
+
+HTTP POST 요청을 수행한다 (Content-Type: application/json). JSON API 테스트에 적합하다.
+
+```lua
+local resp = http.post_json(TARGET .. "/api/login", '{"username":"admin","password":"admin"}')
+print(resp.status)       -- 200 or 401
+print(resp.body)         -- JSON 응답
 ```
 
 #### `http.head(url)`
@@ -394,20 +494,26 @@ print(TARGET)  -- "http://example.com"
 
 ### 차단된 API
 
-다음은 샌드박스에서 차단된다.
+다음은 샌드박스에서 차단된다. `os`, `io` 테이블 자체가 nil이므로 `os.clock()`, `os.time()` 등도 사용 불가하다.
 
 ```lua
-io.open(...)      -- 파일 시스템 접근 불가
-os.execute(...)   -- 시스템 명령 실행 불가
+io.open(...)      -- 파일 시스템 접근 불가 (io == nil)
+os.execute(...)   -- 시스템 명령 실행 불가 (os == nil)
+os.clock()        -- 시간 함수도 불가 (os == nil) → math.random() 사용
 require(...)      -- 외부 모듈 로드 불가
+loadfile(...)     -- 파일 로드 불가
 ```
 
 ### 예제 플러그인 모음
 
-#### 백업 파일 탐지
+#### 백업 파일 탐지 (SPA 오탐 방지)
 
 ```lua
 -- scripts/backup_files.lua
+-- SPA 감지: 존재하지 않는 경로도 200+HTML을 반환하는지 확인
+local baseline = http.get(TARGET .. "/nonexistent_sentinel_check_" .. tostring(math.random(100000, 999999)))
+local is_spa = baseline and baseline.status == 200
+
 local paths = {
     "/backup.zip", "/backup.tar.gz", "/db.sql",
     "/dump.sql", "/site.tar", "/www.zip"
@@ -416,11 +522,16 @@ local paths = {
 for _, path in ipairs(paths) do
     local resp = http.get(TARGET .. path)
     if resp.status == 200 and #resp.body > 100 then
-        report.finding("high", "custom",
-            "Backup File Exposed: " .. path,
-            "Sensitive backup file is publicly accessible.",
-            TARGET .. path
-        )
+        -- SPA인 경우 HTML 응답은 무시 (실제 파일이 아님)
+        local body_start = resp.body:sub(1, 200):lower()
+        local is_html = body_start:find("<!doctype") or body_start:find("<html")
+        if not (is_spa and is_html) then
+            report.finding("high", "custom",
+                "Backup File Exposed: " .. path,
+                "Sensitive backup file is publicly accessible.",
+                TARGET .. path
+            )
+        end
     end
 end
 ```
@@ -467,7 +578,7 @@ end
 
 ```json
 {
-  "sentinel_version": "0.1.0",
+  "sentinel_version": "0.1.1",
   "target": "http://example.com",
   "scan_timestamp": "2026-03-20T10:30:00Z",
   "summary": {
@@ -524,7 +635,7 @@ jq '.summary' report.json
 ```bash
 make build        # 개발 빌드
 make release      # 릴리즈 빌드 (최적화 + strip)
-make test         # 전체 테스트 (31개)
+make test         # 전체 테스트 (48개)
 make lint         # clippy --deny warnings
 make fmt          # rustfmt 자동 포매팅
 make check        # fmt-check + lint + test
@@ -615,6 +726,18 @@ sentinel --target http://example.com -vv 2>&1 | grep "Script"
 
 ```bash
 sentinel --target http://slow-target.com --timeout 30 --rps 3 --threads 10
+```
+
+### SPA 대상에서 크롤링 결과가 적음
+
+SPA(Angular, React, Vue)는 HTML에 `<a href>` 링크가 적어 크롤러가 엔드포인트를 발견하기 어려울 수 있다.
+
+1. `--crawl-max-urls`를 200 이상으로 설정하여 JS 번들 분석 범위 확대
+2. `-vv` 모드에서 `"JS endpoint discovered"` 로그로 발견된 API 경로 확인
+3. 인증이 필요한 SPA라면 `--cookie` 또는 `--token`으로 인증 정보 전달
+
+```bash
+sentinel --target http://spa-app.local --crawl-depth 4 --crawl-max-urls 300 -vv 2>&1 | grep "JS endpoint"
 ```
 
 ### GitHub Actions 빌드 실패

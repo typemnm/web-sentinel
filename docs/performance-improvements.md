@@ -1,7 +1,12 @@
 # Sentinel 성능 개선 구현 방안
 
 > 분석 기준 버전: 0.1.0
-> 항목 수: 12개 (Critical 4 / High 3 / Medium 3 / Low 2)
+> 항목 수: 12개 (Critical 4 / High 3 / Medium 3 / Low 2) + **v0.1.1 신규 7개**
+>
+> **최종 업데이트: 2026-03-24**
+> 아래 항목 중 상당수가 v0.1.0 개선 사이클에서 구현 완료 또는 부분 해소되었다.
+> v0.1.1 사이클에서 정확도(FP 제거) 및 SPA 지원 개선 7건이 추가 구현되었다.
+> 각 항목에 `[구현됨]`, `[부분 해소]`, `[미구현]` 상태를 표기한다.
 
 ---
 
@@ -9,7 +14,9 @@
 
 ---
 
-### ① 동일 URL에 중복 GET 요청 제거
+### ① 동일 URL에 중복 GET 요청 제거 — `[구현됨]`
+
+> **상태**: `run()`에서 1회 GET한 `base_resp`를 패시브 체크에 참조 전달하고, `base_resp.elapsed_ms`를 `check_injections_multi()`의 target baseline으로 재사용하여 중복 GET 제거 완료.
 
 **파일**: `src/network/analyzer.rs`
 
@@ -87,7 +94,9 @@ impl HttpResponse {
 
 ---
 
-### ② Phase 1(포트 스캔) + Phase 2(핑거프린팅) 병렬 실행
+### ② Phase 1(포트 스캔) + Phase 2(핑거프린팅) 병렬 실행 — `[구현됨]`
+
+> **상태**: `tokio::join!`으로 Phase 1+2, Phase 4+5 병렬 실행 구현 완료. orchestrator.rs에서 확인 가능.
 
 **파일**: `src/core/orchestrator.rs`
 
@@ -159,7 +168,9 @@ findings.extend(script_findings?);
 
 ---
 
-### ③ SQLi 파라미터 체크 병렬화
+### ③ SQLi 파라미터 체크 병렬화 — `[구현됨]`
+
+> **상태**: `check_sqli`, `check_path_traversal`, `check_cmdi` 모두 파라미터별 `join_all` 병렬화 완료. 폼 인젝션도 `join_all` 적용.
 
 **파일**: `src/network/analyzer.rs:132~175`
 
@@ -237,7 +248,9 @@ pub struct ScopeGuard {
 
 ---
 
-### ④ Fingerprint 정규식 전역 1회 컴파일
+### ④ Fingerprint 정규식 전역 1회 컴파일 — `[구현됨]`
+
+> **상태**: `OnceLock` 패턴으로 fingerprint.rs 및 crawler.rs에서 정규식 캐싱 구현 완료.
 
 **파일**: `src/network/fingerprint.rs:37~41`
 
@@ -299,7 +312,9 @@ impl Fingerprinter {
 
 ---
 
-### ⑤ SQLi 응답 바디 `to_lowercase()` 최적화
+### ⑤ SQLi 응답 바디 `to_lowercase()` 최적화 — `[구현됨]`
+
+> **상태**: `memchr` 크레이트 도입 완료. `memmem_find_icase()`가 SIMD 가속 `memchr::memmem::find()`를 사용하여 바이트 수준 검색 수행. 8KB 이하는 스택 버퍼, 이상은 힙 할당.
 
 **파일**: `src/network/analyzer.rs:153`
 
@@ -360,7 +375,9 @@ let body_lower = resp.body[..check_range].to_lowercase();
 
 ---
 
-### ⑥ Lua 스크립트 병렬 실행
+### ⑥ Lua 스크립트 병렬 실행 — `[구현됨]`
+
+> **상태**: `spawn_blocking` + `join_all`로 Lua 스크립트 28개 병렬 실행 구현 완료. engine.rs에서 확인 가능.
 
 **파일**: `src/scripting/engine.rs:38~46`
 
@@ -441,7 +458,9 @@ pub async fn run_all(&mut self, target: &str) -> Result<Vec<Finding>> {
 
 ---
 
-### ⑦ `try_403_bypass` 헤더 동시 시도
+### ⑦ `try_403_bypass` 헤더 동시 시도 — `[구현됨]`
+
+> **상태**: `select_ok`로 bypass 헤더 + 경로 변형 11개 기법 동시 시도 구현 완료. analyzer.rs에서 확인 가능.
 
 **파일**: `src/network/analyzer.rs:277~294`
 
@@ -508,7 +527,9 @@ pub async fn try_403_bypass(
 
 ---
 
-### ⑧ Connection Pool 크기를 스레드 수에 비례 조정
+### ⑧ Connection Pool 크기를 스레드 수에 비례 조정 — `[구현됨]`
+
+> **상태**: `pool_max_idle_per_host`를 `(threads / 2).clamp(10, 100)`으로 동적 조정, `pool_idle_timeout(90s)` 및 `tcp_keepalive(30s)` 추가 완료. http.rs에서 확인 가능.
 
 **파일**: `src/network/http.rs:38`
 
@@ -550,7 +571,9 @@ impl HttpClient {
 
 ---
 
-### ⑨ 헤더 전용 체크에서 바디 로드 스킵
+### ⑨ 헤더 전용 체크에서 바디 로드 스킵 — `[부분 해소]`
+
+> **상태**: `http.head()` 메서드 구현 완료 (Lua API에서 사용 가능). 엔진 내부에서 패시브 체크에 HEAD 사용은 ①과 병행하여 향후 적용.
 
 **파일**: `src/network/http.rs:97~109`
 
@@ -603,7 +626,9 @@ impl HttpResponse {
 
 ---
 
-### ⑩ `req.try_clone().unwrap()` 패닉 제거
+### ⑩ `req.try_clone().unwrap()` 패닉 제거 — `[구현됨]`
+
+> **상태**: 재시도 루프에서 매 시도마다 새 RequestBuilder를 구성하도록 변경 완료. try_clone() 제거됨.
 
 **파일**: `src/network/http.rs:59`
 
@@ -660,7 +685,9 @@ pub async fn get_with_headers(
 
 ---
 
-### ⑪ Findings 수집 구조를 Mutex-free로 전환
+### ⑪ Findings 수집 구조를 Mutex-free로 전환 — `[구현됨]`
+
+> **상태**: 각 Phase가 독립 `Vec<Finding>`을 반환하고 마지막에 병합하는 구조로 전환 완료. Mutex 제거됨. orchestrator.rs에서 확인 가능.
 
 **파일**: `src/core/orchestrator.rs:20`
 
@@ -715,7 +742,9 @@ pub async fn run(&mut self) -> Result<()> {
 
 ---
 
-### ⑫ `header_name.to_lowercase()` 불필요 할당 제거
+### ⑫ `header_name.to_lowercase()` 불필요 할당 제거 — `[구현됨]`
+
+> **상태**: CRLF 헤더 검사에서 case-insensitive 비교로 전환 완료. 불필요한 할당 제거됨.
 
 **파일**: `src/network/analyzer.rs:232`
 
@@ -758,22 +787,231 @@ async fn from_reqwest(resp: Response) -> Result<Self> {
 
 ---
 
-## 구현 우선순위 요약
+## 구현 상태 요약
 
-| 우선순위 | 항목 | 예상 효과 | 난이도 |
-|----------|------|-----------|--------|
-| 1 | ① 중복 GET 제거 | RTT × 2 절약 / 즉각적 | 낮음 |
-| 2 | ④ Regex OnceLock | 재컴파일 비용 제거 | 낮음 |
-| 3 | ⑩ try_clone 패닉 제거 | 안전성 확보 | 낮음 |
-| 4 | ② Phase 병렬화 | 스캔 시간 20~40% 감소 | 중간 |
-| 5 | ③ SQLi 병렬화 | 파라미터 수 비례 향상 | 중간 |
-| 6 | ⑦ 403bypass 병렬 | 4→1 RTT | 중간 |
-| 7 | ⑪ Mutex 제거 | ②와 병행 필수 | 중간 |
-| 8 | ⑥ Lua 병렬화 | 스크립트 수 비례 향상 | 높음 |
-| 9 | ⑤ memchr 검색 | 메모리 할당 압박 감소 | 낮음 |
-| 10 | ⑧ Pool 크기 조정 | 고부하 시 연결 재사용 | 낮음 |
-| 11 | ⑨ HEAD 요청 | 대역폭 절약 (①로 대체 가능) | 낮음 |
-| 12 | ⑫ lowercase 제거 | 미미한 할당 제거 | 매우 낮음 |
+| 항목 | 예상 효과 | 상태 |
+|------|-----------|------|
+| ① 중복 GET 제거 | RTT × 2 절약 | **구현됨** — base_resp 참조 + elapsed_ms 재사용 |
+| ② Phase 병렬화 | 스캔 시간 20~40% 감소 | **구현됨** — tokio::join! |
+| ③ SQLi 병렬화 | 파라미터 수 비례 향상 | **구현됨** — 파라미터별 join_all |
+| ④ Regex OnceLock | 재컴파일 비용 제거 | **구현됨** — OnceLock 패턴 |
+| ⑤ memchr 검색 | 메모리 할당 압박 감소 | **구현됨** — SIMD 가속 memchr::memmem |
+| ⑥ Lua 병렬화 | 스크립트 수 비례 향상 | **구현됨** — spawn_blocking |
+| ⑦ 403bypass 병렬 | 4→1 RTT | **구현됨** — select_ok |
+| ⑧ Pool 크기 조정 | 고부하 시 연결 재사용 | **구현됨** — (threads/2).clamp(10,100) |
+| ⑨ HEAD 요청 | 대역폭 절약 | **부분 해소** — head() 메서드 추가 |
+| ⑩ try_clone 패닉 제거 | 안전성 확보 | **구현됨** — 매 시도 새 빌더 |
+| ⑪ Mutex 제거 | contention 근본 해소 | **구현됨** — Vec 반환 + 마지막 병합 |
+| ⑫ lowercase 제거 | 미미한 할당 제거 | **구현됨** — case-insensitive 비교 |
 
-> **권장 구현 순서**: ①④⑩ → ②⑪ → ③⑦ → ⑥ → ⑤⑧⑨⑫
-> ①과 ⑪은 ②(병렬화)의 사전 조건이므로 먼저 구현해야 한다.
+**12개 항목 중 11개 구현 완료, 1개 부분 해소 (⑨ — ①로 대부분 해소).**
+
+---
+
+## v0.1.1 정확도 및 SPA 지원 개선 (2026-03-24)
+
+> 7개 항목 모두 구현 완료. OWASP Juice Shop (Angular SPA) 스캔 기준
+> 오탐 18건 → 0건, 탐지된 API 엔드포인트 0개 → 15개 이상.
+
+---
+
+### ⑬ SPA JS 엔드포인트 추출 — `[구현됨]`
+
+> **상태**: 크롤러가 `<script src="...">` 태그에서 JS 파일을 최대 10개 가져와
+> API 경로 패턴(`/api/`, `/rest/`, `/v1/`, `/graphql` 등)을 추출한다.
+
+**파일**: `src/network/crawler.rs`
+
+**이전 문제**
+
+SPA(Single Page Application)는 HTML에 링크가 거의 없고 모든 라우팅이 JS에서 처리된다.
+기존 크롤러는 `.js` 파일을 `is_static_resource()`로 무시하여 API 엔드포인트를 전혀 발견하지 못했다.
+
+```
+# Juice Shop (Angular) 기존 결과
+Crawl complete: 0 links, 0 forms discovered
+```
+
+**구현 내용**
+
+1. `SCRIPT_SRC_RE`: `<script src="...">` 태그에서 JS 파일 URL 추출
+2. `JS_STRING_API_RE`: JS 파일 내 API 경로 패턴 추출 (28개 접두사)
+3. JS 파일 최대 10개 fetch → `fetch/axios` regex + API path regex 동시 적용
+
+```rust
+// 새로 추가된 정적 regex
+static SCRIPT_SRC_RE: OnceLock<Regex> = OnceLock::new();     // <script src="...">
+static JS_STRING_API_RE: OnceLock<Regex> = OnceLock::new();   // "/api/...", "/rest/..." 등
+```
+
+**결과**: Juice Shop에서 `/rest/user/login`, `/api/Users`, `/api/Products`, `/api/Challenges` 등 15개 이상의 API 엔드포인트가 자동 발견되어 인젝션 테스트 대상에 포함됨.
+
+---
+
+### ⑭ SSTI 오탐 방지 — `[구현됨]`
+
+> **상태**: Lua `ssti_probe.lua`의 페이로드를 `{{7*7}}`→`{{913*773}}`로 변경하고
+> 베이스라인 체크를 추가하여 페이지에 자연 존재하는 숫자로 인한 오탐을 제거.
+
+**파일**: `scripts/ssti_probe.lua`
+
+**이전 문제**
+
+`{{7*7}}` → `49` 검사에서, 페이지 내 자연적으로 존재하는 "49" (예: Angular 빌드 해시, CSS 속성 등)와 매칭되어 오탐이 발생했다.
+
+**구현 내용**
+
+1. 모든 SSTI 프로브를 `913*773=705649` 고유 수학식으로 변경 (Rust 분석기와 동일)
+2. 스크립트 시작 시 `TARGET`에 GET 요청 → `baseline_body` 확보
+3. `expected` 값이 `baseline_body`에 이미 존재하면 해당 프로브 건너뜀
+
+```lua
+-- 변경 전 (오탐 발생)
+{payload = "{{7*7}}", expected = "49", engine = "Jinja2/Twig/Nunjucks"},
+
+-- 변경 후
+{payload = "{{913*773}}", expected = "705649", engine = "Jinja2/Twig/Nunjucks"},
+```
+
+**결과**: Juice Shop SSTI 오탐 1건 → 0건 제거. 실제 SSTI 취약점(`/render` Handlebars)은 정확히 탐지.
+
+---
+
+### ⑮ 백업 파일 SPA 오탐 제거 — `[구현됨]`
+
+> **상태**: `backup_files.lua`에 SPA 감지 로직을 추가하여, 존재하지 않는 경로에도
+> 200+HTML을 반환하는 SPA에서 백업 파일 오탐을 완전히 제거.
+
+**파일**: `scripts/backup_files.lua`
+
+**이전 문제**
+
+SPA(Angular, React 등)는 클라이언트 사이드 라우팅을 위해 모든 경로에 200 + HTML 셸을 반환한다.
+`/backup.zip`, `/dump.sql` 등에 대해서도 200이 반환되어 15건 이상의 오탐이 발생했다.
+
+**구현 내용**
+
+1. 랜덤 존재하지 않는 경로에 GET → 200이면 SPA로 판정
+2. 각 백업 파일 응답의 `Content-Type`과 본문 시작 부분 검사
+3. SPA이고 응답이 HTML이면 스킵 (진짜 백업 파일은 바이너리/텍스트)
+
+```lua
+local baseline = http.get(TARGET .. "/nonexistent_sentinel_check_" .. tostring(math.random(100000, 999999)))
+if baseline and baseline.status == 200 then
+    baseline_is_html = true  -- SPA 감지
+end
+```
+
+**결과**: Juice Shop에서 백업 파일 오탐 15건 → 0건.
+
+---
+
+### ⑯ .htaccess/.htpasswd 시그니처 정밀화 — `[구현됨]`
+
+> **상태**: `.htpasswd` 탐지 시그니처를 `":"` (모든 HTML에 매칭) →
+> `"$apr1$"`, `"{SHA}"`, `"$2y$"` 해시 패턴으로 변경.
+
+**파일**: `scripts/htaccess_exposure.lua`
+
+**이전 문제**
+
+`.htpasswd` 탐지에 `":"` (콜론) 시그니처를 사용하여, 모든 HTML 페이지에 매칭되었다.
+SPA에서는 `.htpasswd` 경로에도 HTML 셸이 반환되어 오탐이 발생.
+
+**구현 내용**
+
+1. `":"` → `"$apr1$"`, `"{SHA}"`, `"$2y$"` (실제 htpasswd 해시 포맷)
+2. 추가로 응답 본문 시작 부분의 HTML 태그 검사
+
+**결과**: htaccess 오탐 1건 (`.htpasswd` 크리티컬) → 0건.
+
+---
+
+### ⑰ Django 핑거프린트 오탐 수정 — `[구현됨]`
+
+> **상태**: Django 탐지 패턴에서 `X-Frame-Options: SAMEORIGIN` 헤더 매칭을 제거하고,
+> 본문 기반 시그니처(`csrfmiddlewaretoken`, `django.contrib`)만 사용하도록 변경.
+
+**파일**: `src/network/fingerprint.rs`
+
+**이전 문제**
+
+`X-Frame-Options: SAMEORIGIN` 헤더는 Django 외에도 많은 프레임워크/서버가 설정한다.
+Juice Shop(Express/Angular)에서 이 헤더가 존재하여 "Django detected"로 오탐이 발생했다.
+
+**구현 내용**
+
+```rust
+// 변경 전 (오탐 유발)
+add_pattern!("Django", "Framework",
+    headers: ["x-frame-options" => r"SAMEORIGIN"],
+    body: [r"csrfmiddlewaretoken"]);
+
+// 변경 후
+add_pattern!("Django", "Framework",
+    headers: [],
+    body: [r"csrfmiddlewaretoken", r"django\.contrib|__django_"]);
+```
+
+**결과**: Juice Shop에서 Django 오탐 → 제거.
+
+---
+
+### ⑱ 프레임워크 핑거프린트 확장 — `[구현됨]`
+
+> **상태**: Angular, React, Vue.js, Flask 탐지 패턴을 추가하여
+> SPA 및 Python 프레임워크 식별 범위를 확장.
+
+**파일**: `src/network/fingerprint.rs`
+
+**구현 내용**
+
+```rust
+add_pattern!("Flask", "Framework",
+    headers: [], body: [r"Werkzeug|flask\.pocoo\.org|flask_"]);
+add_pattern!("Angular", "Framework",
+    headers: [], body: [r"ng-version=|ng-app|angular\.min\.js|ng-controller"]);
+add_pattern!("React", "Framework",
+    headers: [], body: [r"react\.production\.min\.js|data-reactroot|_reactRootContainer"]);
+add_pattern!("Vue.js", "Framework",
+    headers: [], body: [r"vue\.min\.js|vue\.runtime|v-cloak|__vue__"]);
+```
+
+**결과**: 기존 14개 → 18개 핑거프린트 패턴. Juice Shop에서 Angular 정확 탐지.
+
+---
+
+### ⑲ prototype_pollution.lua 샌드박스 호환 — `[구현됨]`
+
+> **상태**: `os.clock()` 호출 → `math.random()` 대체.
+> Lua 샌드박스에서 `os` 모듈이 nil로 설정되어 스크립트가 크래시하던 문제 해결.
+
+**파일**: `scripts/prototype_pollution.lua`
+
+**구현 내용**
+
+```lua
+-- 변경 전 (크래시)
+local marker = "SENTINEL_PP_" .. tostring(os.clock()):gsub("%.", "")
+
+-- 변경 후
+local marker = "SENTINEL_PP_" .. tostring(math.random(100000, 999999))
+```
+
+**결과**: 프로토타입 오염 탐지 스크립트가 정상 동작.
+
+---
+
+## v0.1.1 구현 상태 요약
+
+| 항목 | 분류 | 효과 | 상태 |
+|------|------|------|------|
+| ⑬ SPA JS 엔드포인트 추출 | 탐지 범위 확대 | SPA 앱에서 API 15개+ 자동 발견 | **구현됨** |
+| ⑭ SSTI 오탐 방지 | 정확도 향상 | `49` 자연 존재 오탐 제거 | **구현됨** |
+| ⑮ 백업 파일 SPA 오탐 | 정확도 향상 | SPA 오탐 15건 제거 | **구현됨** |
+| ⑯ htaccess 시그니처 정밀화 | 정확도 향상 | 범용 시그니처 오탐 제거 | **구현됨** |
+| ⑰ Django FP 오탐 수정 | 정확도 향상 | 헤더 기반 오탐 제거 | **구현됨** |
+| ⑱ 프레임워크 핑거프린트 확장 | 탐지 범위 확대 | 4개 프레임워크 추가 | **구현됨** |
+| ⑲ prototype_pollution 수정 | 버그 수정 | 스크립트 크래시 해결 | **구현됨** |
+
+**v0.1.0 + v0.1.1 합산: 19개 항목 중 18개 구현 완료, 1개 부분 해소.**

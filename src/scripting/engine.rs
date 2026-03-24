@@ -165,6 +165,20 @@ fn setup_sandbox(
     }))?;
     lua_err!(http_table.set("post", post_fn))?;
 
+    // --- http.post_json(url, json_body) ---
+    let client_post_json = client.clone();
+    let post_json_fn = lua_err!(lua.create_function(move |lua_ctx, (url, body): (String, String)| {
+        let client = client_post_json.clone();
+        let resp = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(client.post_json(&url, &body))
+        });
+        match resp {
+            Ok(r) => resp_to_lua_table(&lua_ctx, &r),
+            Err(e) => Err(mlua::Error::external(format!("http.post_json: {}", e))),
+        }
+    }))?;
+    lua_err!(http_table.set("post_json", post_json_fn))?;
+
     // --- http.head(url) ---
     let client_head = client.clone();
     let head_fn = lua_err!(lua.create_function(move |lua_ctx, url: String| {
@@ -299,6 +313,10 @@ mod tests {
             scope: "example.com".to_string(),
             timeout_secs: 5,
             user_agent: None,
+            auth: crate::core::scanner::AuthMethod::default(),
+            max_crawl_depth: 3,
+            max_crawl_urls: 100,
+            thorough: false,
         })
     }
 

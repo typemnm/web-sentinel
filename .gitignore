@@ -8,6 +8,7 @@ sentinel_cves.db
 # Scan output
 sentinel_report.json
 output/
+scans/
 
 # IDE
 .idea/
@@ -18,3 +19,6 @@ output/
 # OS
 .DS_Store
 Thumbs.db
+
+# personal notes
+docs/performance-improvements.md

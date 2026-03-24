@@ -2,6 +2,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
+/// Authentication method for scanning behind login walls
+#[derive(Debug, Clone, Default)]
+pub enum AuthMethod {
+    #[default]
+    None,
+    /// Raw cookie header value: "session=abc123; token=xyz"
+    Cookie(String),
+    /// Bearer token for Authorization header
+    Bearer(String),
+    /// Basic auth (username, password)
+    Basic(String, String),
+    /// Custom header (name, value) — for API keys etc.
+    CustomHeader(String, String),
+}
+
 /// Core scan configuration passed throughout the application
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -19,6 +34,11 @@ pub struct ScanConfig {
     pub scope: String,
     pub timeout_secs: u64,
     pub user_agent: Option<String>,
+    pub auth: AuthMethod,
+    pub max_crawl_depth: usize,
+    pub max_crawl_urls: usize,
+    /// Thorough mode: more evasion variants, slower but deeper
+    pub thorough: bool,
 }
 
 /// Shared scan context (passed via Arc to all async tasks)
@@ -125,6 +145,10 @@ mod tests {
             scope: "example.com".to_string(),
             timeout_secs: 10,
             user_agent: None,
+            auth: AuthMethod::default(),
+            max_crawl_depth: 3,
+            max_crawl_urls: 100,
+            thorough: false,
         };
 
         let ctx = ScanContext::new(config);

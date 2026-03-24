@@ -2156,6 +2156,7 @@ dependencies = [
  "futures",
  "governor",
  "headless_chrome",
+ "memchr",
  "mlua",
  "predicates",
  "regex",

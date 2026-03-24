@@ -8,6 +8,7 @@ use tracing::{debug, warn};
 
 use crate::core::scanner::{Finding, FindingCategory, ScanContext, Severity};
 use crate::network::crawler::DiscoveredForm;
+use crate::network::evasion::{self, EvasionStrategy};
 use crate::network::http::{HttpClient, HttpResponse};
 use crate::network::scope::ScopeGuard;
 
@@ -45,30 +46,55 @@ static SQL_PAYLOADS: &[&str] = &[
     "' OR ''='",
 ];
 
-/// Time-based blind SQLi payloads (expect >= 4500ms response)
+/// Time-based blind SQLi payloads (expect response time significantly above baseline)
 static SQL_TIME_PAYLOADS: &[&str] = &[
     "1' AND SLEEP(5)--",
     "1' AND pg_sleep(5)--",
     "1'; WAITFOR DELAY '0:0:5'--",
 ];
 
-const SQL_TIME_THRESHOLD_MS: u64 = 4500;
+/// Fixed delay expected from SLEEP(5) payloads (ms)
+const TIME_INJECT_DELAY_MS: u64 = 4000;
 
-/// Path traversal payloads
+/// Path traversal payloads — PortSwigger labs + CTF bypass techniques
 static TRAVERSAL_PAYLOADS: &[&str] = &[
+    // Basic
     "../../etc/passwd",
+    "../../../etc/passwd",
     "..\\..\\windows\\win.ini",
-    "....//....//etc/passwd",
-    "..%2f..%2fetc%2fpasswd",
-    "..%252f..%252fetc%252fpasswd",
+    // Recursive strip bypass (....// → ../ after single strip)
+    "....//....//....//etc/passwd",
+    // URL-encoding
+    "..%2f..%2f..%2fetc%2fpasswd",
+    // Double URL-encoding (PortSwigger lab: "double URL-encode the ../ sequence")
+    "%252e%252e%252f%252e%252e%252f%252e%252e%252fetc%252fpasswd",
+    // Null-byte bypass (PortSwigger lab: "null byte bypass")
+    "../../../etc/passwd%00.png",
+    "../../../etc/passwd%00.jpg",
+    // Absolute path (PortSwigger lab: "absolute path bypass")
+    "/etc/passwd",
+    // Dot-segment with trailing slash obfuscation
+    "..%c0%af..%c0%afetc/passwd",
+    // UTF-8 overlong encoding
+    "%c0%ae%c0%ae/%c0%ae%c0%ae/%c0%ae%c0%ae/etc/passwd",
+    // Mixed encoding
+    "..%252f..%252fetc/passwd",
+    // Windows targets
+    "..\\..\\..\\windows\\system.ini",
+    "..%5c..%5c..%5cwindows%5csystem.ini",
 ];
 
 static TRAVERSAL_SIGS: &[&[u8]] = &[
     b"root:x:0:0:",
     b"daemon:x:",
+    b"bin:x:",
+    b"nobody:x:",
     b"[boot loader]",
     b"[fonts]",
     b"; for 16-bit app support",
+    b"[extensions]",
+    // /etc/hostname or /proc patterns
+    b"PRETTY_NAME=",
 ];
 
 /// Command injection payloads — echo-based (signature in response body)
@@ -85,6 +111,31 @@ static CMDI_TIME_PAYLOADS: &[&str] = &[
     "|sleep 5",
     "$(sleep 5)",
     "`sleep 5`",
+];
+
+/// SSTI payloads: (payload_string, expected_result_in_body)
+/// Uses uncommon multiplication results (e.g., 913*773=705649) to avoid
+/// false positives from numbers that appear naturally in page content.
+/// Covers Jinja2, Twig, ERB, FreeMarker, Pebble, Thymeleaf, Mako, Smarty
+static SSTI_PAYLOADS: &[(&str, &str)] = &[
+    // Jinja2 / Twig / Nunjucks — {{913*773}} → 705649
+    ("{{913*773}}", "705649"),
+    // Jinja2 string repeat — {{913*'7'}} → "7" repeated 913 times
+    ("{{913*'7'}}", "7777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777"),
+    // ERB (Ruby) — <%=913*773%> → 705649
+    ("<%=913*773%>", "705649"),
+    // FreeMarker / Mako — ${913*773} → 705649
+    ("${913*773}", "705649"),
+    // Smarty — {913*773} → 705649
+    ("{913*773}", "705649"),
+    // Thymeleaf (Spring) — [[${913*773}]] → 705649
+    ("[[${913*773}]]", "705649"),
+];
+
+/// SSTI parameter names commonly used in template-rendering endpoints
+static SSTI_PARAMS: &[&str] = &[
+    "message", "name", "template", "content", "text", "body",
+    "title", "comment", "desc", "greeting", "bio", "value",
 ];
 
 /// CRLF injection payloads: (payload, header name to look for in response)
@@ -195,15 +246,19 @@ impl ResponseAnalyzer {
         injection_urls.extend(discovered_urls.iter().take(19).cloned());
 
         let (inject_results, param_probe_results) = tokio::join!(
-            self.check_injections_multi(&injection_urls),
+            self.check_injections_multi(&injection_urls, base_resp.elapsed_ms),
             self.probe_common_params(&injection_urls),
         );
         findings.extend(inject_results?);
         findings.extend(param_probe_results?);
 
-        // ── Phase B2: form POST/GET injection ────────────────────────────
-        for form in forms.iter().take(10) {
-            match self.check_form_injection(form).await {
+        // ── Phase B2: form POST/GET injection (parallel) ─────────────────
+        let form_tasks: Vec<_> = forms.iter().take(10).map(|form| {
+            self.check_form_injection(form)
+        }).collect();
+        let form_results = join_all(form_tasks).await;
+        for result in form_results {
+            match result {
                 Ok(f) => findings.extend(f),
                 Err(e) => warn!("Form injection error: {}", e),
             }
@@ -235,10 +290,17 @@ impl ResponseAnalyzer {
     }
 
     /// Run injection checks (SQLi/Traversal/CMDi/CRLF/Redirect) on multiple URLs
-    async fn check_injections_multi(&self, urls: &[String]) -> Result<Vec<Finding>> {
+    ///
+    /// `target_baseline_ms` — elapsed_ms from the initial base_resp GET on the
+    /// first URL (target).  Re-used to avoid a duplicate baseline request (①).
+    async fn check_injections_multi(
+        &self,
+        urls: &[String],
+        target_baseline_ms: u64,
+    ) -> Result<Vec<Finding>> {
         let mut all_findings = Vec::new();
 
-        for url in urls {
+        for (idx, url) in urls.iter().enumerate() {
             let parsed = match url::Url::parse(url) {
                 Ok(p) => p,
                 Err(_) => continue,
@@ -247,18 +309,31 @@ impl ResponseAnalyzer {
                 continue; // param-less URLs handled by probe_common_params
             }
 
-            let (sqli, traversal, cmdi, crlf, redirect) = tokio::join!(
-                self.check_sqli(url),
+            // Reuse the base_resp elapsed_ms for the target (idx 0) to avoid
+            // an extra duplicate GET request (perf item ①).
+            let baseline_ms = if idx == 0 {
+                target_baseline_ms
+            } else {
+                match self.client.get(url).await {
+                    Ok(resp) => resp.elapsed_ms,
+                    Err(_) => 500, // conservative default
+                }
+            };
+
+            let (sqli, traversal, cmdi, crlf, redirect, ssti) = tokio::join!(
+                self.check_sqli(url, baseline_ms),
                 self.check_path_traversal(url),
-                self.check_cmdi(url),
+                self.check_cmdi(url, baseline_ms),
                 self.check_crlf(url),
                 self.check_open_redirect(url),
+                self.check_ssti(url),
             );
             all_findings.extend(sqli?);
             all_findings.extend(traversal?);
             all_findings.extend(cmdi?);
             all_findings.extend(crlf?);
             all_findings.extend(redirect?);
+            all_findings.extend(ssti?);
         }
 
         Ok(all_findings)
@@ -278,7 +353,7 @@ impl ResponseAnalyzer {
             .take(5)
             .collect();
 
-        for url in paramless {
+        for url in &paramless {
             let base = url.trim_end_matches('/');
             for param in COMMON_PARAMS {
                 // SQLi probe: single quote
@@ -340,6 +415,38 @@ impl ResponseAnalyzer {
             }
         }
 
+        // SSTI probe on param-less URLs (matches PortSwigger /?message= pattern)
+        for url in &paramless {
+            let base = url.trim_end_matches('/');
+            for param in SSTI_PARAMS {
+                for (payload, expected) in SSTI_PAYLOADS {
+                    let test_url = format!("{}?{}={}", base, param, payload);
+                    if !self.scope.is_in_scope(&test_url) { continue; }
+                    if let Ok(resp) = self.client.get(&test_url).await {
+                        if resp.body.contains(expected) && !resp.body.contains(payload) {
+                            let mut f = Finding::new(
+                                Severity::Critical,
+                                FindingCategory::Custom,
+                                format!("SSTI via discovered parameter '{}'", param),
+                                format!(
+                                    "Template expression '{}' evaluated to '{}' on probed param '{}'",
+                                    payload, expected, param
+                                ),
+                                test_url.clone(),
+                            );
+                            f.evidence = Some(format!("Param: {}, Payload: {} → {}", param, payload, expected));
+                            f.remediation = Some(
+                                "Never render user input in templates. Use sandboxed engines.".to_string(),
+                            );
+                            findings.push(f);
+                            // Found SSTI — stop probing this URL
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(findings)
     }
 
@@ -391,8 +498,8 @@ impl ResponseAnalyzer {
                         }
                     }
 
-                    // Time-based blind
-                    if resp.elapsed_ms >= SQL_TIME_THRESHOLD_MS {
+                    // Time-based blind (conservative threshold for forms)
+                    if resp.elapsed_ms >= (1000 + TIME_INJECT_DELAY_MS) {
                         let mut f = Finding::new(
                             Severity::High,
                             FindingCategory::SqlInjection,
@@ -460,7 +567,7 @@ impl ResponseAnalyzer {
     }
 
     // ── SQLi: error-based + time-based blind ────────────────────────────
-    async fn check_sqli(&self, url: &str) -> Result<Vec<Finding>> {
+    async fn check_sqli(&self, url: &str, baseline_ms: u64) -> Result<Vec<Finding>> {
         let parsed = match url::Url::parse(url) {
             Ok(p) => p,
             Err(_) => return Ok(vec![]),
@@ -481,8 +588,9 @@ impl ResponseAnalyzer {
                 let param_name = param_name.clone();
                 let orig_query = original_query.clone();
                 let url_str    = url.to_string();
+                let thorough = self.ctx.config.thorough;
                 async move {
-                    sqli_probe_param(client, scope, url_str, param_name, orig_query).await
+                    sqli_probe_param(client, scope, url_str, param_name, orig_query, baseline_ms, thorough).await
                 }
             })
             .collect();
@@ -524,7 +632,7 @@ impl ResponseAnalyzer {
     }
 
     // ── Command Injection ───────────────────────────────────────────────
-    async fn check_cmdi(&self, url: &str) -> Result<Vec<Finding>> {
+    async fn check_cmdi(&self, url: &str, baseline_ms: u64) -> Result<Vec<Finding>> {
         let parsed = match url::Url::parse(url) {
             Ok(p) => p,
             Err(_) => return Ok(vec![]),
@@ -546,13 +654,68 @@ impl ResponseAnalyzer {
                 let orig_query = original_query.clone();
                 let url_str    = url.to_string();
                 async move {
-                    cmdi_probe_param(client, scope, url_str, param_name, orig_query).await
+                    cmdi_probe_param(client, scope, url_str, param_name, orig_query, baseline_ms).await
                 }
             })
             .collect();
 
         let results = join_all(tasks).await;
         Ok(results.into_iter().flatten().collect())
+    }
+
+    // ── SSTI (Server-Side Template Injection) ──────────────────────────
+    // Covers: Jinja2, Twig, ERB, FreeMarker, Pebble, Smarty, Mako, Thymeleaf
+    // Matches HTB Trial By Fire, PortSwigger SSTI labs, DefCamp Rocket
+    async fn check_ssti(&self, url: &str) -> Result<Vec<Finding>> {
+        let parsed = match url::Url::parse(url) {
+            Ok(p) => p,
+            Err(_) => return Ok(vec![]),
+        };
+        let original_query: Vec<(String, String)> = parsed
+            .query_pairs()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        if original_query.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut findings = Vec::new();
+
+        for (param_name, _) in &original_query {
+            for (payload, expected) in SSTI_PAYLOADS {
+                let Some(test_url) = inject_param(url, param_name, payload, &original_query, false)
+                else { continue };
+                if !self.scope.is_in_scope(&test_url) { continue; }
+
+                if let Ok(resp) = self.client.get(&test_url).await {
+                    if resp.body.contains(expected) {
+                        // Verify it's real SSTI, not just echoed input
+                        // The expected value (e.g. "49") should appear but the raw payload should not
+                        let is_evaluated = !resp.body.contains(payload);
+                        if is_evaluated {
+                            let mut f = Finding::new(
+                                Severity::Critical,
+                                FindingCategory::Custom,
+                                format!("SSTI in parameter '{}' (template evaluated)", param_name),
+                                format!(
+                                    "Template expression '{}' evaluated to '{}' — confirmed server-side template injection",
+                                    payload, expected
+                                ),
+                                test_url,
+                            );
+                            f.evidence = Some(format!("Payload: {} → Response contains: {}", payload, expected));
+                            f.remediation = Some(
+                                "Never render user input directly in templates. Use sandboxed template engines or escape all input.".to_string(),
+                            );
+                            findings.push(f);
+                            return Ok(findings);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(findings)
     }
 
     // ── CRLF Injection ──────────────────────────────────────────────────
@@ -591,7 +754,9 @@ impl ResponseAnalyzer {
                 }
 
                 if let Ok(resp) = self.client.get(&test_url).await {
-                    if resp.headers.keys().any(|k| k.contains(expected_header)) {
+                    // Case-insensitive header check (headers stored lowercase by reqwest,
+                    // but check contains() for injected header fragments too)
+                    if resp.headers.keys().any(|k| k.to_lowercase().contains(expected_header)) {
                         let mut f = Finding::new(
                             Severity::High,
                             FindingCategory::CrlfInjection,
@@ -644,8 +809,17 @@ impl ResponseAnalyzer {
                 }
 
                 let test_url = parsed.as_str().to_string();
-                if let Ok(resp) = self.client.get(&test_url).await {
-                    if resp.url.contains("evil-example.com") {
+                // Use no-redirect to inspect Location header directly
+                // (avoids actually navigating to evil-example.com)
+                if let Ok(resp) = self.client.get_no_redirect(&test_url).await {
+                    let is_redirect = (300..400).contains(&resp.status);
+                    let location_evil = resp.headers
+                        .get("location")
+                        .map(|loc| loc.contains("evil-example.com"))
+                        .unwrap_or(false);
+                    // Also check if body/url contains it (meta refresh, JS redirect)
+                    let body_evil = resp.body.contains("evil-example.com");
+                    if (is_redirect && location_evil) || body_evil {
                         findings.push(Finding::new(
                             Severity::Medium,
                             FindingCategory::Custom,
@@ -935,70 +1109,98 @@ fn inject_param(
     Some(parsed.as_str().to_string())
 }
 
-/// SQLi probe: error-based + time-based blind
+/// SQLi probe: error-based + time-based blind + WAF evasion variants
 async fn sqli_probe_param(
     client: HttpClient,
     scope: ScopeGuard,
     url: String,
     param_name: String,
     original_query: Vec<(String, String)>,
+    baseline_ms: u64,
+    thorough: bool,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
 
-    // Error-based
+    // Error-based — with WAF evasion variants (fast or thorough)
     for payload in SQL_PAYLOADS {
-        let Some(test_url) = inject_param(&url, &param_name, payload, &original_query, false)
-        else { continue };
-        if !scope.is_in_scope(&test_url) { continue; }
+        let variants = if thorough {
+            evasion::generate_variants(payload)
+        } else {
+            evasion::generate_fast_variants(payload)
+        };
+        for (encoded_payload, strategy) in variants {
+            let Some(test_url) = inject_param(&url, &param_name, &encoded_payload, &original_query, false)
+            else { continue };
+            if !scope.is_in_scope(&test_url) { continue; }
 
-        if let Ok(resp) = client.get(&test_url).await {
-            let body_bytes = resp.body.as_bytes();
-            for sig in SQL_ERROR_SIGS {
-                if memmem_find_icase(body_bytes, sig) {
-                    debug!("SQLi signal at {} param={}", url, param_name);
-                    let mut f = Finding::new(
-                        Severity::High,
-                        FindingCategory::SqlInjection,
-                        format!("Potential SQLi in parameter '{}'", param_name),
-                        format!(
-                            "SQL error '{}' found with payload '{}'",
-                            std::str::from_utf8(sig).unwrap_or("?"),
-                            payload
-                        ),
-                        test_url,
-                    );
-                    f.evidence    = Some(format!("Payload: {}", payload));
-                    f.remediation = Some("Use parameterized queries / prepared statements".to_string());
-                    findings.push(f);
-                    return findings; // one finding per param is enough
+            if let Ok(resp) = client.get(&test_url).await {
+                let body_bytes = resp.body.as_bytes();
+                for sig in SQL_ERROR_SIGS {
+                    if memmem_find_icase(body_bytes, sig) {
+                        let evasion_note = if strategy != EvasionStrategy::None {
+                            format!(" (WAF bypass: {:?})", strategy)
+                        } else {
+                            String::new()
+                        };
+                        debug!("SQLi signal at {} param={}{}", url, param_name, evasion_note);
+                        let mut f = Finding::new(
+                            Severity::High,
+                            FindingCategory::SqlInjection,
+                            format!("Potential SQLi in parameter '{}'", param_name),
+                            format!(
+                                "SQL error '{}' found with payload '{}'{}",
+                                std::str::from_utf8(sig).unwrap_or("?"),
+                                encoded_payload,
+                                evasion_note,
+                            ),
+                            test_url,
+                        );
+                        f.evidence    = Some(format!("Payload: {}{}", encoded_payload, evasion_note));
+                        f.remediation = Some("Use parameterized queries / prepared statements".to_string());
+                        findings.push(f);
+                        return findings; // one finding per param is enough
+                    }
                 }
             }
         }
     }
 
-    // Time-based blind (only if error-based found nothing)
+    // Time-based blind (only if error-based found nothing) — with evasion
+    let time_threshold = baseline_ms + TIME_INJECT_DELAY_MS;
     for payload in SQL_TIME_PAYLOADS {
-        let Some(test_url) = inject_param(&url, &param_name, payload, &original_query, false)
-        else { continue };
-        if !scope.is_in_scope(&test_url) { continue; }
+        let variants = if thorough {
+            evasion::generate_variants(payload)
+        } else {
+            evasion::generate_fast_variants(payload)
+        };
+        for (encoded_payload, strategy) in variants {
+            let Some(test_url) = inject_param(&url, &param_name, &encoded_payload, &original_query, false)
+            else { continue };
+            if !scope.is_in_scope(&test_url) { continue; }
 
-        if let Ok(resp) = client.get(&test_url).await {
-            if resp.elapsed_ms >= SQL_TIME_THRESHOLD_MS {
-                debug!("SQLi time-based at {} param={} ({}ms)", url, param_name, resp.elapsed_ms);
-                let mut f = Finding::new(
-                    Severity::High,
-                    FindingCategory::SqlInjection,
-                    format!("Blind SQLi (time-based) in parameter '{}'", param_name),
-                    format!(
-                        "Response delayed {}ms (threshold {}ms) with payload '{}'",
-                        resp.elapsed_ms, SQL_TIME_THRESHOLD_MS, payload
-                    ),
-                    test_url,
-                );
-                f.evidence    = Some(format!("Payload: {} | Elapsed: {}ms", payload, resp.elapsed_ms));
-                f.remediation = Some("Use parameterized queries / prepared statements".to_string());
-                findings.push(f);
-                return findings;
+            if let Ok(resp) = client.get(&test_url).await {
+                if resp.elapsed_ms >= time_threshold {
+                    let evasion_note = if strategy != EvasionStrategy::None {
+                        format!(" (WAF bypass: {:?})", strategy)
+                    } else {
+                        String::new()
+                    };
+                    debug!("SQLi time-based at {} param={} ({}ms, baseline={}ms){}", url, param_name, resp.elapsed_ms, baseline_ms, evasion_note);
+                    let mut f = Finding::new(
+                        Severity::High,
+                        FindingCategory::SqlInjection,
+                        format!("Blind SQLi (time-based) in parameter '{}'", param_name),
+                        format!(
+                            "Response delayed {}ms (baseline {}ms + {}ms threshold) with payload '{}'{}",
+                            resp.elapsed_ms, baseline_ms, TIME_INJECT_DELAY_MS, encoded_payload, evasion_note
+                        ),
+                        test_url,
+                    );
+                    f.evidence    = Some(format!("Payload: {} | Elapsed: {}ms | Baseline: {}ms{}", encoded_payload, resp.elapsed_ms, baseline_ms, evasion_note));
+                    f.remediation = Some("Use parameterized queries / prepared statements".to_string());
+                    findings.push(f);
+                    return findings;
+                }
             }
         }
     }
@@ -1056,6 +1258,7 @@ async fn cmdi_probe_param(
     url: String,
     param_name: String,
     original_query: Vec<(String, String)>,
+    baseline_ms: u64,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
 
@@ -1084,22 +1287,23 @@ async fn cmdi_probe_param(
     }
 
     // Time-based
+    let time_threshold = baseline_ms + TIME_INJECT_DELAY_MS;
     for payload in CMDI_TIME_PAYLOADS {
         let Some(test_url) = inject_param(&url, &param_name, payload, &original_query, true)
         else { continue };
         if !scope.is_in_scope(&test_url) { continue; }
 
         if let Ok(resp) = client.get(&test_url).await {
-            if resp.elapsed_ms >= SQL_TIME_THRESHOLD_MS {
-                debug!("CMDi time-based at {} param={} ({}ms)", url, param_name, resp.elapsed_ms);
+            if resp.elapsed_ms >= time_threshold {
+                debug!("CMDi time-based at {} param={} ({}ms, baseline={}ms)", url, param_name, resp.elapsed_ms, baseline_ms);
                 let mut f = Finding::new(
                     Severity::Critical,
                     FindingCategory::CommandInjection,
                     format!("Command Injection (time-based) in parameter '{}'", param_name),
-                    format!("Response delayed {}ms with payload '{}'", resp.elapsed_ms, payload),
+                    format!("Response delayed {}ms (baseline {}ms) with payload '{}'", resp.elapsed_ms, baseline_ms, payload),
                     test_url,
                 );
-                f.evidence    = Some(format!("Payload: {} | Elapsed: {}ms", payload, resp.elapsed_ms));
+                f.evidence    = Some(format!("Payload: {} | Elapsed: {}ms | Baseline: {}ms", payload, resp.elapsed_ms, baseline_ms));
                 f.remediation = Some("Never pass user input to shell commands; use safe APIs".to_string());
                 findings.push(f);
                 return findings;
@@ -1312,17 +1516,30 @@ fn check_body_patterns(resp: &HttpResponse, url: &str) -> Vec<Finding> {
     findings
 }
 
-/// Case-insensitive byte search without heap allocation
+/// Case-insensitive byte search — SIMD-accelerated via `memchr::memmem`.
+///
+/// Converts haystack to lowercase in a stack buffer (up to 8 KB) or heap
+/// (larger bodies), then uses `memchr::memmem::find()` which leverages
+/// Two-Way / SIMD on x86_64 and aarch64.  Needle **must** already be lowercase.
 fn memmem_find_icase(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || haystack.len() < needle.len() {
         return false;
     }
-    haystack.windows(needle.len()).any(|window| {
-        window
-            .iter()
-            .zip(needle.iter())
-            .all(|(h, n)| h.to_ascii_lowercase() == *n)
-    })
+
+    // For short haystacks, use the simple loop to avoid allocation
+    if haystack.len() <= 8192 {
+        // Stack-based lowercase conversion
+        let mut buf = [0u8; 8192];
+        let slice = &mut buf[..haystack.len()];
+        for (dst, src) in slice.iter_mut().zip(haystack.iter()) {
+            *dst = src.to_ascii_lowercase();
+        }
+        return memchr::memmem::find(slice, needle).is_some();
+    }
+
+    // For larger bodies, heap-allocate the lowercase copy
+    let lower: Vec<u8> = haystack.iter().map(|b| b.to_ascii_lowercase()).collect();
+    memchr::memmem::find(&lower, needle).is_some()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1352,6 +1569,10 @@ mod tests {
             scope: "127.0.0.1".to_string(),
             timeout_secs: 5,
             user_agent: None,
+            auth: crate::core::scanner::AuthMethod::default(),
+            max_crawl_depth: 3,
+            max_crawl_urls: 100,
+            thorough: false,
         })
     }
 

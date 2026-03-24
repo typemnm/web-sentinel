@@ -99,6 +99,10 @@ mod tests {
             scope: "localhost".to_string(),
             timeout_secs: 2,
             user_agent: None,
+            auth: crate::core::scanner::AuthMethod::default(),
+            max_crawl_depth: 3,
+            max_crawl_urls: 100,
+            thorough: false,
         })
     }
 

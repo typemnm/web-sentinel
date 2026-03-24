@@ -98,11 +98,18 @@ impl Orchestrator {
             }
         }
 
-        // Phase 3.5: Crawl — discover links and forms
-        info!("[Phase 3.5] Crawling target page for links and forms...");
+        // Phase 3.5: Recursive Crawl — discover links and forms at depth
+        let max_depth = self.ctx.config.max_crawl_depth;
+        let max_urls = self.ctx.config.max_crawl_urls;
+        info!("[Phase 3.5] Recursive crawling target (max_depth={}, max_urls={})...",
+              max_depth, max_urls);
         let scope = ScopeGuard::new(&self.ctx.config.scope);
         let crawler = Crawler::new(http_client.clone(), scope.clone());
-        let crawl_result = match crawler.crawl(&target).await {
+        let crawl_result = match crawler.crawl_recursive(
+            &target,
+            max_depth,
+            max_urls,
+        ).await {
             Ok(cr) => {
                 info!(
                     "Crawl complete: {} links, {} forms discovered",
@@ -116,6 +123,12 @@ impl Orchestrator {
                 crate::network::crawler::CrawlResult::default()
             }
         };
+
+        // Build tech context string from fingerprint for priority adjustments
+        let detected_techs: Vec<String> = fp_result.technologies
+            .iter()
+            .map(|t| t.name.to_lowercase())
+            .collect();
 
         // ② Phase 4(HTTP 체크) + Phase 5(Lua) 동시 실행
         info!("[Phase 4+5] HTTP checks & Lua scripts in parallel...");
@@ -160,6 +173,35 @@ impl Orchestrator {
                 Err(e) => warn!("Browser phase error: {:#}", e),
             }
         }
+
+        // Enrich findings: add tech-stack context to descriptions when relevant
+        for finding in &mut all_findings {
+            let title_lower = finding.title.to_lowercase();
+            let desc_lower = finding.description.to_lowercase();
+            let combined = format!("{} {}", title_lower, desc_lower);
+
+            // If PHP detected and finding relates to LFI/traversal/SSTI → note it
+            if detected_techs.iter().any(|t| t.contains("php")) {
+                if combined.contains("traversal") || combined.contains("lfi") || combined.contains("ssti") || combined.contains("template") {
+                    finding.description.push_str(" [PHP detected on target — higher exploitation likelihood]");
+                }
+            }
+            // If Java detected and finding relates to deserialization/SSTI
+            if detected_techs.iter().any(|t| t.contains("java") || t.contains("spring") || t.contains("tomcat")) {
+                if combined.contains("deseriali") || combined.contains("freemarker") || combined.contains("thymeleaf") {
+                    finding.description.push_str(" [Java/Spring detected — higher exploitation likelihood]");
+                }
+            }
+            // If Python detected and finding relates to SSTI (Jinja2)
+            if detected_techs.iter().any(|t| t.contains("python") || t.contains("flask") || t.contains("django")) {
+                if combined.contains("ssti") || combined.contains("jinja") || combined.contains("template") {
+                    finding.description.push_str(" [Python/Flask detected — Jinja2 SSTI likely exploitable]");
+                }
+            }
+        }
+
+        // Deduplicate & aggregate findings
+        let all_findings = crate::report::dedup::deduplicate(all_findings);
 
         // 리포트 작성
         info!("Scan complete. {} findings.", all_findings.len());
