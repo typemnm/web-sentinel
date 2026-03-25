@@ -1,0 +1,7 @@
+{
+  "tool_name": "Read",
+  "tool_input_preview": "{\"file_path\":\"/home/typemnm/sentinel/docs/performance-improvements.md\"}",
+  "error": "File content (13749 tokens) exceeds maximum allowed tokens (10000). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.",
+  "timestamp": "2026-03-25T07:46:25.467Z",
+  "retry_count": 1
+}

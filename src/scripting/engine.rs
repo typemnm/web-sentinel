@@ -129,7 +129,7 @@ fn setup_sandbox(
 ) -> Result<()> {
     let globals = lua.globals();
 
-    for dangerous in &["io", "os", "dofile", "loadfile", "require", "package"] {
+    for dangerous in &["io", "os", "dofile", "loadfile", "require", "package", "debug", "load"] {
         lua_err!(globals.set(*dangerous, mlua::Value::Nil))?;
     }
 

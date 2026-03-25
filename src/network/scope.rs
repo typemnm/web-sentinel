@@ -4,6 +4,7 @@ use url::Url;
 #[derive(Clone)]
 pub struct ScopeGuard {
     allowed_host: String,
+    subdomain_suffix: String,
 }
 
 impl ScopeGuard {
@@ -14,7 +15,8 @@ impl ScopeGuard {
         } else {
             scope.to_string()
         };
-        Self { allowed_host: host }
+        let subdomain_suffix = format!(".{}", host);
+        Self { allowed_host: host, subdomain_suffix }
     }
 
     /// Returns true if the URL is within scope
@@ -22,7 +24,7 @@ impl ScopeGuard {
         match Url::parse(url) {
             Ok(parsed) => {
                 let host = parsed.host_str().unwrap_or("");
-                host == self.allowed_host || host.ends_with(&format!(".{}", self.allowed_host))
+                host == self.allowed_host || host.ends_with(&self.subdomain_suffix)
             }
             Err(_) => false,
         }

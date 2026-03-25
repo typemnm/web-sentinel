@@ -206,7 +206,7 @@ end
 | `report.finding(sev, cat, title, desc, url)` | Report a vulnerability |
 | `TARGET` | Global: current scan target URL |
 
-**Sandbox**: `io`, `os`, `require`, `loadfile` are stripped — scripts cannot access the filesystem or execute system commands.
+**Sandbox**: `io`, `os`, `require`, `loadfile`, `debug`, `load` are stripped — scripts cannot access the filesystem, execute system commands, or escape the sandbox via runtime code generation.
 
 **28 built-in plugins**: SSRF (15+ IP bypass encodings, cloud metadata), SSTI (10+ engines, WAF bypass), JWT vulnerabilities, NoSQL injection, XXE injection, IDOR detection, deserialization, file upload bypass, prototype pollution, JSON API injection, GraphQL introspection, debug endpoints, WordPress config backup, robots.txt analysis, backup files, admin panels, source maps, CORS reflection, host header injection, .htaccess/.htpasswd, info disclosure, error page leak, JSONP callback, vulnerable JS libraries, .git exposure, .env exposure.
 

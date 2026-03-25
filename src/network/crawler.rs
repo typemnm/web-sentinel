@@ -1,6 +1,6 @@
 use anyhow::Result;
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::OnceLock;
 use tracing::{debug, info};
 
@@ -92,31 +92,56 @@ impl Crawler {
         let mut visited = HashSet::new();
         visited.insert(normalize_url(target));
 
-        let mut queue: Vec<(String, usize)> = vec![(target.to_string(), 0)];
+        let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+        queue.push_back((target.to_string(), 0));
         let mut total_visited = 0usize;
 
-        while let Some((url, depth)) = queue.pop() {
-            if depth > max_depth || total_visited >= max_urls {
+        const CRAWL_BATCH_SIZE: usize = 10;
+
+        while !queue.is_empty() && total_visited < max_urls {
+            // Drain up to CRAWL_BATCH_SIZE URLs respecting depth and max_urls limits
+            let batch: Vec<(String, usize)> = {
+                let mut b = Vec::with_capacity(CRAWL_BATCH_SIZE);
+                while let Some((url, depth)) = queue.pop_front() {
+                    if depth > max_depth {
+                        continue;
+                    }
+                    b.push((url, depth));
+                    if b.len() >= CRAWL_BATCH_SIZE || total_visited + b.len() >= max_urls {
+                        break;
+                    }
+                }
+                b
+            };
+
+            if batch.is_empty() {
                 break;
             }
 
-            match self.crawl_page(&url).await {
-                Ok(page_result) => {
-                    total_visited += 1;
-                    // Enqueue newly discovered URLs for deeper crawling
-                    for discovered_url in &page_result.urls {
-                        let norm = normalize_url(discovered_url);
-                        if visited.insert(norm) {
-                            all_result.urls.push(discovered_url.clone());
-                            if depth + 1 <= max_depth {
-                                queue.push((discovered_url.clone(), depth + 1));
+            // Crawl all batch URLs concurrently
+            let page_futures: Vec<_> = batch.iter()
+                .map(|(url, _)| self.crawl_page(url))
+                .collect();
+            let page_results = futures::future::join_all(page_futures).await;
+
+            for ((url, depth), page_result) in batch.iter().zip(page_results) {
+                match page_result {
+                    Ok(page_result) => {
+                        total_visited += 1;
+                        for discovered_url in &page_result.urls {
+                            let norm = normalize_url(discovered_url);
+                            if visited.insert(norm) {
+                                all_result.urls.push(discovered_url.clone());
+                                if depth + 1 <= max_depth {
+                                    queue.push_back((discovered_url.clone(), depth + 1));
+                                }
                             }
                         }
+                        all_result.forms.extend(page_result.forms);
                     }
-                    all_result.forms.extend(page_result.forms);
-                }
-                Err(e) => {
-                    debug!("Crawl failed for {}: {:#}", url, e);
+                    Err(e) => {
+                        debug!("Crawl failed for {}: {:#}", url, e);
+                    }
                 }
             }
         }
@@ -191,36 +216,38 @@ impl Crawler {
                 }
             }
         }
-        // Fetch up to 10 JS files and extract API paths
-        for js_url in js_urls.iter().take(10) {
-            if let Ok(js_resp) = self.client.get(js_url).await {
-                // Use the broader API path regex on JS file contents
-                for cap in js_api_re.captures_iter(&js_resp.body) {
-                    if let Some(path_match) = cap.get(1) {
-                        let path = path_match.as_str();
-                        // Skip overly generic or short paths
-                        if path.len() < 4 { continue; }
-                        if let Ok(resolved) = base_url.join(path) {
-                            let url_str = resolved.as_str().to_string();
-                            if self.scope.is_in_scope(&url_str)
-                                && seen.insert(normalize_url(&url_str))
-                            {
-                                debug!("JS endpoint discovered: {} (from {})", url_str, js_url);
-                                result.urls.push(url_str);
-                            }
+        // Fetch up to 10 JS files concurrently
+        let js_fetch_futures: Vec<_> = js_urls.iter().take(10)
+            .map(|js_url| self.client.get(js_url))
+            .collect();
+        let js_responses = futures::future::join_all(js_fetch_futures).await;
+
+        for js_resp in js_responses.into_iter().flatten() {
+            // Use the broader API path regex on JS file contents
+            for cap in js_api_re.captures_iter(&js_resp.body) {
+                if let Some(path_match) = cap.get(1) {
+                    let path = path_match.as_str();
+                    if path.len() < 4 { continue; }
+                    if let Ok(resolved) = base_url.join(path) {
+                        let url_str = resolved.as_str().to_string();
+                        if self.scope.is_in_scope(&url_str)
+                            && seen.insert(normalize_url(&url_str))
+                        {
+                            debug!("JS endpoint discovered: {} (from JS bundle)", url_str);
+                            result.urls.push(url_str);
                         }
                     }
                 }
-                // Also apply the fetch/axios regex on JS files
-                for cap in js_re.captures_iter(&js_resp.body) {
-                    if let Some(path_match) = cap.get(1) {
-                        if let Ok(resolved) = base_url.join(path_match.as_str()) {
-                            let url_str = resolved.as_str().to_string();
-                            if self.scope.is_in_scope(&url_str)
-                                && seen.insert(normalize_url(&url_str))
-                            {
-                                result.urls.push(url_str);
-                            }
+            }
+            // Also apply the fetch/axios regex on JS files
+            for cap in js_re.captures_iter(&js_resp.body) {
+                if let Some(path_match) = cap.get(1) {
+                    if let Ok(resolved) = base_url.join(path_match.as_str()) {
+                        let url_str = resolved.as_str().to_string();
+                        if self.scope.is_in_scope(&url_str)
+                            && seen.insert(normalize_url(&url_str))
+                        {
+                            result.urls.push(url_str);
                         }
                     }
                 }
@@ -290,12 +317,18 @@ fn normalize_url(url: &str) -> String {
 }
 
 fn is_static_resource(url: &str) -> bool {
-    let lower = url.to_lowercase();
-    let extensions = [
-        ".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff",
-        ".woff2", ".ttf", ".eot", ".map", ".pdf", ".zip", ".tar",
+    // Only check path component (ignore query string)
+    let path = url.split('?').next().unwrap_or(url);
+    let bytes = path.as_bytes();
+    let extensions: &[&[u8]] = &[
+        b".css", b".js", b".png", b".jpg", b".jpeg", b".gif", b".svg", b".ico",
+        b".woff", b".woff2", b".ttf", b".eot", b".map", b".pdf", b".zip", b".tar",
     ];
-    extensions.iter().any(|ext| lower.ends_with(ext))
+    extensions.iter().any(|ext| {
+        bytes.len() >= ext.len()
+            && bytes[bytes.len() - ext.len()..]
+                .eq_ignore_ascii_case(ext)
+    })
 }
 
 #[cfg(test)]

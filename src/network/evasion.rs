@@ -1,6 +1,9 @@
 //! WAF evasion module — encode payloads to bypass common WAFs
 //! (Cloudflare, AWS WAF, ModSecurity, Akamai, etc.)
 
+use regex::Regex;
+use std::sync::OnceLock;
+
 /// Encoding strategies for WAF bypass
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -117,21 +120,25 @@ fn unicode_overlong(s: &str) -> String {
     out
 }
 
+static CASE_MIXING_PATTERNS: OnceLock<Vec<(Regex, String)>> = OnceLock::new();
+
 fn case_mixing(s: &str) -> String {
-    let keywords = [
-        "SELECT", "UNION", "INSERT", "UPDATE", "DELETE", "FROM", "WHERE",
-        "AND", "OR", "ORDER", "GROUP", "HAVING", "LIMIT", "SLEEP", "WAITFOR",
-        "DELAY", "BENCHMARK", "NULL", "SCRIPT", "ALERT", "ONERROR", "ONLOAD",
-    ];
+    let patterns = CASE_MIXING_PATTERNS.get_or_init(|| {
+        let keywords = [
+            "SELECT", "UNION", "INSERT", "UPDATE", "DELETE", "FROM", "WHERE",
+            "AND", "OR", "ORDER", "GROUP", "HAVING", "LIMIT", "SLEEP", "WAITFOR",
+            "DELAY", "BENCHMARK", "NULL", "SCRIPT", "ALERT", "ONERROR", "ONLOAD",
+        ];
+        keywords.iter().map(|kw| {
+            let mixed = alternate_case(kw);
+            let lower = kw.to_lowercase();
+            let re = Regex::new(&format!("(?i){}", regex::escape(&lower))).unwrap();
+            (re, mixed)
+        }).collect()
+    });
     let mut result = s.to_string();
-    for kw in &keywords {
-        let mixed = alternate_case(kw);
-        // Case-insensitive replace
-        let lower = kw.to_lowercase();
-        let re_pattern = format!("(?i){}", regex::escape(&lower));
-        if let Ok(re) = regex::Regex::new(&re_pattern) {
-            result = re.replace_all(&result, mixed.as_str()).to_string();
-        }
+    for (re, mixed) in patterns {
+        result = re.replace_all(&result, mixed.as_str()).to_string();
     }
     result
 }
@@ -149,37 +156,38 @@ fn alternate_case(s: &str) -> String {
         .collect()
 }
 
+static INLINE_COMMENT_PATTERNS: OnceLock<Vec<(Regex, String)>> = OnceLock::new();
+
 fn inline_comment(s: &str) -> String {
-    let keywords = [
-        "UNION", "SELECT", "INSERT", "UPDATE", "DELETE", "FROM", "WHERE",
-        "AND", "OR", "ORDER", "GROUP",
-    ];
-    let mut result = s.to_string();
-    for kw in &keywords {
-        let lower = kw.to_lowercase();
-        let re_pattern = format!("(?i){}", regex::escape(&lower));
-        if let Ok(re) = regex::Regex::new(&re_pattern) {
+    let patterns = INLINE_COMMENT_PATTERNS.get_or_init(|| {
+        let keywords = [
+            "UNION", "SELECT", "INSERT", "UPDATE", "DELETE", "FROM", "WHERE",
+            "AND", "OR", "ORDER", "GROUP",
+        ];
+        keywords.iter().map(|kw| {
+            let lower = kw.to_lowercase();
+            let re = Regex::new(&format!("(?i){}", regex::escape(&lower))).unwrap();
             let half = kw.len() / 2;
-            let replacement = format!("{}/**/{}",
-                &kw[..half].to_uppercase(),
-                &kw[half..].to_uppercase()
-            );
-            result = re.replace_all(&result, replacement.as_str()).to_string();
-        }
+            let replacement = format!("{}/**/{}", &kw[..half].to_uppercase(), &kw[half..].to_uppercase());
+            (re, replacement)
+        }).collect()
+    });
+    let mut result = s.to_string();
+    for (re, replacement) in patterns {
+        result = re.replace_all(&result, replacement.as_str()).to_string();
     }
     result
 }
 
+static HEX_ENCODE_RE: OnceLock<Regex> = OnceLock::new();
+
 fn hex_encode_strings(s: &str) -> String {
-    // Encode single-quoted string literals to hex: 'abc' → 0x616263
-    let mut result = s.to_string();
-    let re = regex::Regex::new(r"'([^']+)'").unwrap();
-    result = re.replace_all(&result, |caps: &regex::Captures| {
+    let re = HEX_ENCODE_RE.get_or_init(|| Regex::new(r"'([^']+)'").unwrap());
+    re.replace_all(s, |caps: &regex::Captures| {
         let inner = &caps[1];
         let hex: String = inner.bytes().map(|b| format!("{:02x}", b)).collect();
         format!("0x{}", hex)
-    }).to_string();
-    result
+    }).to_string()
 }
 
 fn char_bypass(s: &str) -> String {
@@ -212,21 +220,24 @@ fn html_entity(s: &str) -> String {
     out
 }
 
+static WHITESPACE_SUB_PATTERNS: OnceLock<Vec<(Regex, String)>> = OnceLock::new();
+
 fn whitespace_sub(s: &str) -> String {
-    // Replace spaces between SQL keywords with tabs or newlines
-    let keywords = [
-        "UNION", "SELECT", "INSERT", "UPDATE", "DELETE", "FROM", "WHERE",
-        "AND", "OR", "ORDER", "SLEEP", "WAITFOR",
-    ];
-    let mut result = s.to_string();
-    for kw in &keywords {
-        let lower = kw.to_lowercase();
-        // " UNION " → "\tUNION\t"
-        let pattern = format!("(?i) {} ", regex::escape(&lower));
-        if let Ok(re) = regex::Regex::new(&pattern) {
+    let patterns = WHITESPACE_SUB_PATTERNS.get_or_init(|| {
+        let keywords = [
+            "UNION", "SELECT", "INSERT", "UPDATE", "DELETE", "FROM", "WHERE",
+            "AND", "OR", "ORDER", "SLEEP", "WAITFOR",
+        ];
+        keywords.iter().map(|kw| {
+            let lower = kw.to_lowercase();
+            let re = Regex::new(&format!("(?i) {} ", regex::escape(&lower))).unwrap();
             let replacement = format!("\t{}\t", kw);
-            result = re.replace_all(&result, replacement.as_str()).to_string();
-        }
+            (re, replacement)
+        }).collect()
+    });
+    let mut result = s.to_string();
+    for (re, replacement) in patterns {
+        result = re.replace_all(&result, replacement.as_str()).to_string();
     }
     result
 }

@@ -175,30 +175,29 @@ impl Orchestrator {
         }
 
         // Enrich findings: add tech-stack context to descriptions when relevant
-        for finding in &mut all_findings {
-            let title_lower = finding.title.to_lowercase();
-            let desc_lower = finding.description.to_lowercase();
-            let combined = format!("{} {}", title_lower, desc_lower);
+        let all_findings: Vec<Finding> = all_findings.into_iter().map(|mut f| {
+            let combined = format!("{} {}", f.title.to_lowercase(), f.description.to_lowercase());
 
             // If PHP detected and finding relates to LFI/traversal/SSTI → note it
             if detected_techs.iter().any(|t| t.contains("php")) {
                 if combined.contains("traversal") || combined.contains("lfi") || combined.contains("ssti") || combined.contains("template") {
-                    finding.description.push_str(" [PHP detected on target — higher exploitation likelihood]");
+                    f.description = format!("{} [PHP detected on target — higher exploitation likelihood]", f.description);
                 }
             }
             // If Java detected and finding relates to deserialization/SSTI
             if detected_techs.iter().any(|t| t.contains("java") || t.contains("spring") || t.contains("tomcat")) {
                 if combined.contains("deseriali") || combined.contains("freemarker") || combined.contains("thymeleaf") {
-                    finding.description.push_str(" [Java/Spring detected — higher exploitation likelihood]");
+                    f.description = format!("{} [Java/Spring detected — higher exploitation likelihood]", f.description);
                 }
             }
             // If Python detected and finding relates to SSTI (Jinja2)
             if detected_techs.iter().any(|t| t.contains("python") || t.contains("flask") || t.contains("django")) {
                 if combined.contains("ssti") || combined.contains("jinja") || combined.contains("template") {
-                    finding.description.push_str(" [Python/Flask detected — Jinja2 SSTI likely exploitable]");
+                    f.description = format!("{} [Python/Flask detected — Jinja2 SSTI likely exploitable]", f.description);
                 }
             }
-        }
+            f
+        }).collect();
 
         // Deduplicate & aggregate findings
         let all_findings = crate::report::dedup::deduplicate(all_findings);

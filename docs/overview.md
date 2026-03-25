@@ -273,7 +273,7 @@ tokio::main (multi_thread)
 | HTTP 클라이언트 | `reqwest 0.12` | HTTP/2, TLS, 동적 커넥션 풀 |
 | 헤드리스 브라우저 | `headless_chrome 1` | DevTools Protocol |
 | Lua VM | `mlua 0.10` | LuaJIT 5.4, 샌드박스, `spawn_blocking` 병렬 |
-| 상태 DB | `sled 0.34` | 임베디드 K-V 스토어 |
+| 상태 DB | `sled 0.34` | 임베디드 K-V 스토어 (스캔 상태 기록용, 향후 SQLite 통합 예정) |
 | CVE DB | `rusqlite 0.31` | SQLite 번들 빌드 |
 | 레이트 리미터 | `governor 0.8` | 초당 요청 수 제한 (--rps 플래그 연동) |
 | 비동기 유틸 | `futures 0.3` | `join_all`, `select_ok` |
@@ -350,6 +350,8 @@ require → nil   -- 임의 모듈 로드 차단
 package → nil
 dofile  → nil
 loadfile→ nil
+debug   → nil   -- 내부 Lua 상태 접근 차단 (registry/hook 탈출 방지)
+load    → nil   -- 런타임 코드 생성 차단 (문자열 → 바이트코드 변환 방지)
 ```
 
 스크립트에서 허용된 API:
@@ -474,6 +476,18 @@ sentinel --target https://api.com --auth-header "X-API-Key:sk-12345"
 | Django 핑거프린트 오탐 수정 | ✅ body-only 시그니처 |
 | 프레임워크 핑거프린트 확장 | ✅ Angular, React, Vue.js, Flask 추가 |
 | prototype_pollution 버그 수정 | ✅ `os.clock()` → `math.random()` |
+
+#### v0.1.2 (2026-03-25)
+
+| 항목 | 분류 | 상태 |
+|------|------|------|
+| Lua 샌드박스 강화 — `debug`, `load` 차단 추가 | 보안 | ✅ `engine.rs` |
+| CVE 버전 비교 오탐 수정 — `-debian` 등 suffix 처리 | 보안 | ✅ `cve.rs` |
+| 크롤러 DFS → BFS 수정 (`VecDeque`) | 버그 | ✅ `crawler.rs` |
+| `get_no_redirect` 클라이언트 재사용 (timeout/user_agent 일관성) | 버그 | ✅ `http.rs` |
+| Regex `OnceLock` 캐싱 — `dedup.rs`, `evasion.rs` | 성능 | ✅ |
+| 미사용 `config` 크레이트 제거 | 정리 | ✅ `Cargo.toml` |
+| Finding 보강 로직 불변 변환 (`into_iter().map()`) | 코드 품질 | ✅ `orchestrator.rs` |
 
 ### 향후 로드맵
 

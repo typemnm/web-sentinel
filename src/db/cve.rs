@@ -224,23 +224,33 @@ impl CveDb {
             ),
         ];
 
+        self.conn.execute_batch("BEGIN")?;
         for (id, desc, cvss, product, version_range) in cves {
             self.insert_cve(id, desc, *cvss, product, version_range)?;
         }
+        self.conn.execute_batch("COMMIT")?;
 
         Ok(())
     }
+}
+
+/// Strip non-numeric suffix from a version component (e.g. "52-debian" → "52")
+fn strip_version_suffix(part: &str) -> Option<u32> {
+    let trimmed = part.trim();
+    // Take leading digits only (stops at first non-digit)
+    let numeric: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
+    numeric.parse().ok()
 }
 
 /// Compare two version strings: returns true if `version` < `max_version`
 fn version_lt(version: &str, max_version: &str) -> bool {
     let v: Vec<u32> = version
         .split('.')
-        .filter_map(|p| p.trim().parse().ok())
+        .filter_map(strip_version_suffix)
         .collect();
     let m: Vec<u32> = max_version
         .split('.')
-        .filter_map(|p| p.trim().parse().ok())
+        .filter_map(strip_version_suffix)
         .collect();
 
     for i in 0..v.len().max(m.len()) {

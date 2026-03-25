@@ -32,6 +32,7 @@ type GovernorLimiter = RateLimiter<
 #[derive(Clone)]
 pub struct HttpClient {
     inner: Client,
+    no_redirect_inner: Client,
     auth: AuthMethod,
     rate_limiter: Arc<GovernorLimiter>,
 }
@@ -52,16 +53,26 @@ impl HttpClient {
             .pool_max_idle_per_host(pool_size)
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(30))
-            .user_agent(ua)
+            .user_agent(ua.clone())
             .danger_accept_invalid_certs(false)
             .redirect(reqwest::redirect::Policy::limited(5))
+            .build()?;
+
+        let no_redirect_client = Client::builder()
+            .timeout(Duration::from_secs(ctx.config.timeout_secs))
+            .pool_max_idle_per_host(pool_size)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(30))
+            .user_agent(ua)
+            .danger_accept_invalid_certs(false)
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
         let rps = ctx.config.rps.max(1);
         let quota = Quota::per_second(NonZeroU32::new(rps).unwrap());
         let rate_limiter = Arc::new(RateLimiter::direct(quota));
 
-        Ok(Self { inner: client, auth: ctx.config.auth.clone(), rate_limiter })
+        Ok(Self { inner: client, no_redirect_inner: no_redirect_client, auth: ctx.config.auth.clone(), rate_limiter })
     }
 
     /// Wait until rate limiter allows a request
@@ -155,11 +166,7 @@ impl HttpClient {
     /// GET without following redirects — for detecting open redirect via Location header
     pub async fn get_no_redirect(&self, url: &str) -> Result<HttpResponse> {
         self.wait_rate_limit().await;
-        let no_redirect_client = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
-        let req = self.apply_auth(no_redirect_client.get(url));
+        let req = self.apply_auth(self.no_redirect_inner.get(url));
         let start = std::time::Instant::now();
         let resp = req.send().await?;
         let elapsed = start.elapsed();

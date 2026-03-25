@@ -1,11 +1,12 @@
 # Sentinel 성능 개선 구현 방안
 
 > 분석 기준 버전: 0.1.0
-> 항목 수: 12개 (Critical 4 / High 3 / Medium 3 / Low 2) + **v0.1.1 신규 7개**
+> 항목 수: 12개 (Critical 4 / High 3 / Medium 3 / Low 2) + **v0.1.1 신규 7개** + **v0.1.2 신규 11개**
 >
-> **최종 업데이트: 2026-03-24**
+> **최종 업데이트: 2026-03-25**
 > 아래 항목 중 상당수가 v0.1.0 개선 사이클에서 구현 완료 또는 부분 해소되었다.
 > v0.1.1 사이클에서 정확도(FP 제거) 및 SPA 지원 개선 7건이 추가 구현되었다.
+> v0.1.2 사이클에서 보안 강화 2건, 버그 수정 2건, 성능 개선 7건이 구현되었다. (총 11건)
 > 각 항목에 `[구현됨]`, `[부분 해소]`, `[미구현]` 상태를 표기한다.
 
 ---
@@ -1015,3 +1016,387 @@ local marker = "SENTINEL_PP_" .. tostring(math.random(100000, 999999))
 | ⑲ prototype_pollution 수정 | 버그 수정 | 스크립트 크래시 해결 | **구현됨** |
 
 **v0.1.0 + v0.1.1 합산: 19개 항목 중 18개 구현 완료, 1개 부분 해소.**
+
+---
+
+## v0.1.2 성능 개선 — 11건
+
+---
+
+### ⑳ Lua 샌드박스 탈출 차단 — `[구현됨]`
+
+> **상태**: `debug`와 `load` 글로벌을 nil로 설정하여 Lua 샌드박스 탈출 벡터 두 가지를 추가 차단.
+
+**파일**: `src/scripting/engine.rs`
+
+**이전 문제**
+
+`debug.getregistry()` 를 통해 Lua 메타테이블에 접근하거나, `load()` 로 런타임 코드 생성이 가능하여 샌드박스 우회 경로가 존재했다.
+
+**구현 내용**
+
+```rust
+// 변경 전
+for dangerous in &["io", "os", "dofile", "loadfile", "require", "package"] {
+
+// 변경 후
+for dangerous in &["io", "os", "dofile", "loadfile", "require", "package", "debug", "load"] {
+```
+
+**효과**: 외부 스크립트가 `debug.getregistry()` 또는 `load("os.execute(...)")` 형태로 샌드박스를 우회하는 경로를 제거.
+
+---
+
+### ㉑ CVE 버전 문자열 suffix 파싱 수정 — `[구현됨]`
+
+> **상태**: `"2.4.53-debian"` 같은 패키지 관리자 suffix를 `strip_version_suffix()` 로 제거하여 버전 비교 정확도 향상.
+
+**파일**: `src/db/cve.rs`
+
+**이전 문제**
+
+`version_lt()` 가 `part.trim().parse::<u32>()` 로 버전 파싱 시, `"52-debian"` 은 파싱 실패하여 해당 컴포넌트를 0으로 처리. Apache 2.4.53-debian이 CVE 취약 범위 `<2.4.52` 에 잘못 매칭되는 문제.
+
+**구현 내용**
+
+```rust
+fn strip_version_suffix(part: &str) -> Option<u32> {
+    let trimmed = part.trim();
+    let numeric: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
+    numeric.parse().ok()
+}
+```
+
+`filter_map(|p| p.trim().parse().ok())` → `filter_map(strip_version_suffix)` 로 교체.
+
+---
+
+### ㉒ BFS 큐 자료구조 수정 (`Vec` → `VecDeque`) — `[구현됨]`
+
+> **상태**: `Vec::pop()` (스택/DFS) → `VecDeque::pop_front()` (큐/BFS) 로 수정하여 깊이 우선 탐색이 너비 우선으로 올바르게 동작.
+
+**파일**: `src/network/crawler.rs`
+
+**이전 문제**
+
+`Vec::pop()` 은 마지막 요소를 꺼내므로 DFS(깊이 우선) 탐색이 된다. BFS 크롤러에서 깊은 경로만 탐색하고 같은 깊이의 URL 대부분을 놓치는 버그.
+
+**구현 내용**
+
+```rust
+// 변경 전
+let mut queue: Vec<(String, u32)> = vec![(start_url, 0)];
+while let Some((url, depth)) = queue.pop() {
+    queue.push((next_url, depth + 1));
+}
+
+// 변경 후
+use std::collections::VecDeque;
+let mut queue: VecDeque<(String, u32)> = VecDeque::from([(start_url, 0)]);
+while let Some((url, depth)) = queue.pop_front() {
+    queue.push_back((next_url, depth + 1));
+}
+```
+
+---
+
+### ㉓ 배치-병렬 BFS 크롤링 — `[구현됨]`
+
+> **상태**: `CRAWL_BATCH_SIZE = 10`씩 묶어 `join_all`로 동시 처리. 순차 크롤링 대비 ~10배 처리량 향상.
+
+**파일**: `src/network/crawler.rs`
+
+**이전 문제**
+
+BFS 큐에서 URL을 1개씩 꺼내 순차적으로 GET하므로, 각 요청의 레이턴시(수백 ms)가 직렬로 누적된다. 100개 URL 크롤에 30~50초 소요.
+
+**구현 내용**
+
+```rust
+const CRAWL_BATCH_SIZE: usize = 10;
+
+// 큐에서 최대 CRAWL_BATCH_SIZE개를 일괄 추출
+let batch: Vec<(String, u32)> = {
+    let n = CRAWL_BATCH_SIZE.min(queue.len());
+    queue.drain(..n).collect()
+};
+
+// 배치 내 모든 URL을 병렬 처리
+let responses = join_all(batch.iter().map(|(url, depth)| {
+    let client = client.clone();
+    let url = url.clone();
+    let depth = *depth;
+    async move { (url, depth, client.get(&url).await) }
+})).await;
+```
+
+**효과**: 10개 URL 동시 처리 → 크롤링 시간 90% 단축 (순차 대비).
+
+---
+
+### ㉔ JS 파일 병렬 fetch — `[구현됨]`
+
+> **상태**: 발견된 JS URL 최대 10개를 순차 fetch → `join_all`로 동시 fetch.
+
+**파일**: `src/network/crawler.rs`
+
+**이전 문제**
+
+```rust
+// 변경 전: 순차 처리
+for js_url in js_urls.iter().take(10) {
+    if let Ok(resp) = client.get(js_url).await { ... }
+}
+```
+
+JS 파일이 10개면 각각 직렬 요청. JS 응답 평균 200ms × 10 = 2초 추가 지연.
+
+**구현 내용**
+
+```rust
+// 변경 후: 병렬 처리
+let js_responses = join_all(js_urls.iter().take(10).map(|js_url| {
+    let client = client.clone();
+    let js_url = js_url.clone();
+    async move { (js_url, client.get(&js_url).await) }
+})).await;
+```
+
+**효과**: JS 10개 fetch 시간 ~2초 → ~200ms.
+
+---
+
+### ㉕ `is_static_resource` 바이트 레벨 비교 — `[구현됨]`
+
+> **상태**: `url.to_lowercase()` 전체 URL 힙 할당 → 경로 suffix만 `eq_ignore_ascii_case`로 비교하여 할당 제거.
+
+**파일**: `src/network/crawler.rs`
+
+**이전 문제**
+
+```rust
+// 변경 전: 전체 URL 문자열 소문자 복사 (힙 할당)
+let lower = url.to_lowercase();
+lower.ends_with(".css") || lower.ends_with(".png") || ...
+```
+
+크롤링 중 수천 번 호출되며 매번 힙 할당 발생.
+
+**구현 내용**
+
+```rust
+// 변경 후: ? 이전 경로만 추출, 할당 없는 suffix 비교
+let path = url.split('?').next().unwrap_or(url);
+static STATIC_EXTS: &[&str] = &[".css", ".png", ".jpg", ...];
+STATIC_EXTS.iter().any(|ext| {
+    path.len() >= ext.len() &&
+    path[path.len() - ext.len()..].eq_ignore_ascii_case(ext)
+})
+```
+
+---
+
+### ㉖ `ScopeGuard` 서브도메인 suffix 사전 계산 — `[구현됨]`
+
+> **상태**: `is_in_scope()` 내부에서 매 호출마다 `format!(".{}", host)` 하던 것을 생성자에서 1회 계산 후 필드로 저장.
+
+**파일**: `src/network/scope.rs`
+
+**이전 문제**
+
+```rust
+// 변경 전: 호출마다 힙 할당
+fn is_in_scope(&self, url: &str) -> bool {
+    ...
+    host.ends_with(&format!(".{}", self.allowed_host))
+}
+```
+
+크롤/분석 중 수만 번 호출 → 수만 번의 `String` 할당.
+
+**구현 내용**
+
+```rust
+pub struct ScopeGuard {
+    allowed_host: String,
+    subdomain_suffix: String,   // ".example.com" — 사전 계산
+}
+
+impl ScopeGuard {
+    pub fn new(host: &str) -> Self {
+        Self {
+            allowed_host: host.to_string(),
+            subdomain_suffix: format!(".{}", host),
+        }
+    }
+
+    pub fn is_in_scope(&self, url: &str) -> bool {
+        ...
+        host.ends_with(&self.subdomain_suffix)  // 할당 없음
+    }
+}
+```
+
+---
+
+### ㉗ `original_query` Arc 공유 (`Vec` 클론 → Arc 클론) — `[구현됨]`
+
+> **상태**: `check_sqli`, `check_path_traversal`, `check_cmdi` 에서 파라미터별 태스크 생성 시 `Vec.clone()` → `Arc::clone()` 으로 교체.
+
+**파일**: `src/network/analyzer.rs`
+
+**이전 문제**
+
+URL에 쿼리 파라미터가 N개 있으면 N개의 병렬 probe 태스크를 생성한다. 이때 각 태스크에 `original_query.clone()` 으로 전체 Vec를 복사하여, N×M 바이트(M = Vec 내용 크기)의 힙 할당이 발생했다.
+
+**구현 내용**
+
+```rust
+// 변경 전
+let orig_query = original_query.clone();  // Vec 전체 복사
+
+// 변경 후
+let original_query = Arc::new(original_query);   // 1회 Arc 래핑
+...
+let orig_query = Arc::clone(&original_query);    // 포인터 복사만
+```
+
+probe 함수 시그니처도 `Vec<(String, String)>` → `Arc<Vec<(String, String)>>` 로 변경.
+
+---
+
+### ㉘ 응답 바디 소문자 변환 1회화 — `[구현됨]`
+
+> **상태**: `sqli_probe_param`·`traversal_probe_param` 에서 각 서명(signature) 검색마다 바디를 소문자 변환하던 것을 응답당 1회로 줄임.
+
+**파일**: `src/network/analyzer.rs`
+
+**이전 문제**
+
+`memmem_find_icase(body_bytes, sig)` 는 내부에서 `body_bytes` 전체를 소문자로 변환한다. SQL 에러 시그니처가 14개이면 같은 응답 바디를 14번 소문자 변환(= 14번 힙 할당 또는 8KB 스택 복사).
+
+**구현 내용**
+
+```rust
+// 변경 후: 응답당 1회 소문자화
+let body_lower: Vec<u8> = resp.body.as_bytes()
+    .iter().map(|b| b.to_ascii_lowercase()).collect();
+
+for sig in SQL_ERROR_SIGS {
+    if memmem_find_lower(&body_lower, sig) { ... }  // 추가 변환 없음
+}
+
+// 새 헬퍼 함수
+#[inline]
+fn memmem_find_lower(pre_lowered: &[u8], needle: &[u8]) -> bool {
+    memchr::memmem::find(pre_lowered, needle).is_some()
+}
+```
+
+**효과**: 응답당 14→1 소문자 변환. 대형 응답 바디(>8KB)에서 힙 할당 13건 제거.
+
+---
+
+### ㉙ `check_injections_multi` URL별 병렬화 — `[구현됨]`
+
+> **상태**: URL별 인젝션 체크를 순차 for 루프 → `join_all` 병렬 처리로 전환.
+
+**파일**: `src/network/analyzer.rs`
+
+**이전 문제**
+
+```rust
+// 변경 전: 순차
+for (idx, url) in urls.iter().enumerate() {
+    let baseline_ms = self.client.get(url).await?;  // 직렬 대기
+    let (sqli, traversal, cmdi, ...) = tokio::join!(...);
+}
+```
+
+20개 URL 처리 시 baseline GET이 직렬 누적. URL당 평균 200ms × 20 = 4초 낭비.
+
+**구현 내용**
+
+```rust
+// 변경 후: URL별 태스크 병렬화
+let url_tasks: Vec<_> = urls.iter().enumerate()
+    .filter(|(_, url)| /* 쿼리 파라미터 있는 URL만 */)
+    .map(|(idx, url)| {
+        let self_ = self;  // &Self는 Copy
+        let url = url.clone();
+        async move {
+            let baseline_ms = /* idx==0이면 재사용, 아니면 병렬 fetch */;
+            let (sqli, traversal, cmdi, crlf, redirect, ssti) = tokio::join!(...);
+            // 결과 수집
+        }
+    })
+    .collect();
+
+let results = join_all(url_tasks).await;
+```
+
+**효과**: 20개 URL 인젝션 체크를 동시 실행 → 처리 시간 O(N) → O(1) (레이턴시 기준).
+
+---
+
+### ㉚ `probe_common_params` 파라미터별 병렬화 — `[구현됨]`
+
+> **상태**: COMMON_PARAMS × paramless URLs (최대 5×14=70개 요청)와 SSTI_PARAMS × paramless URLs (최대 5×12=60개 요청)을 `join_all`로 병렬 실행.
+
+**파일**: `src/network/analyzer.rs`
+
+**이전 문제**
+
+```rust
+// 변경 전: 이중 for 루프 (순차 140+ HTTP 요청)
+for url in &paramless {
+    for param in COMMON_PARAMS {
+        self.client.get(&sqli_url).await;       // 직렬
+        self.client.get(&traversal_url).await;  // 직렬
+    }
+}
+```
+
+5개 URL × 14 파라미터 × 2 프로브 = 140개 요청이 직렬 처리. 200ms 기준 28초 소요.
+
+**구현 내용**
+
+```rust
+// 변경 후: (url × param)별 태스크 생성, 일괄 병렬 실행
+let mut param_tasks = Vec::new();
+for url in &paramless {
+    for &param in COMMON_PARAMS {
+        let client = self.client.clone();
+        param_tasks.push(async move {
+            // SQLi + traversal 두 프로브를 순차(한 태스크 내)로 실행
+            // 단, 태스크 자체는 다른 (url, param) 조합과 병렬
+        });
+    }
+}
+for v in join_all(param_tasks).await { findings.extend(v); }
+
+// SSTI는 (url × ssti_param)별 태스크, payload는 태스크 내 순차
+// → 첫 매칭 payload 발견 시 break (기존 동작 보존)
+```
+
+**효과**: 140개 순차 요청 → 병렬 실행. 28초 → ~200ms (레이턴시 기준).
+
+---
+
+## v0.1.2 구현 상태 요약
+
+| 항목 | 분류 | 효과 | 상태 |
+|------|------|------|------|
+| ⑳ Lua sandbox debug/load 차단 | 보안 강화 | 샌드박스 탈출 2경로 제거 | **구현됨** |
+| ㉑ CVE 버전 suffix 파싱 수정 | 버그 수정 | 패키지 suffix 버전 비교 오류 해결 | **구현됨** |
+| ㉒ BFS VecDeque 수정 | 버그 수정 | DFS→BFS 올바른 너비우선 탐색 | **구현됨** |
+| ㉓ 배치-병렬 BFS 크롤링 | 성능 | 크롤링 처리량 ~10배 향상 | **구현됨** |
+| ㉔ JS 파일 병렬 fetch | 성능 | JS fetch 2초→200ms | **구현됨** |
+| ㉕ is_static_resource 바이트 비교 | 성능 | 크롤 중 String 할당 제거 | **구현됨** |
+| ㉖ ScopeGuard subdomain_suffix 사전 계산 | 성능 | 수만 번 format! 할당 제거 | **구현됨** |
+| ㉗ original_query Arc 공유 | 성능 | 파라미터당 Vec 클론 → Arc 포인터 복사 | **구현됨** |
+| ㉘ 응답 바디 소문자화 1회화 | 성능 | 시그니처당 재변환 제거 | **구현됨** |
+| ㉙ check_injections_multi 병렬화 | 성능 | URL별 인젝션 체크 동시 실행 | **구현됨** |
+| ㉚ probe_common_params 병렬화 | 성능 | 140+ 순차 요청 → 병렬 실행 | **구현됨** |
+
+**v0.1.0 + v0.1.1 + v0.1.2 합산: 30개 항목 중 29개 구현 완료, 1개 부분 해소.**

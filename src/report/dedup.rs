@@ -5,6 +5,7 @@
 //! a single finding with affected URL count.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use tracing::debug;
 
 use crate::core::scanner::{Finding, Severity};
@@ -110,14 +111,17 @@ fn merge_key(f: &Finding) -> String {
     format!("{:?}|{}", f.category, normalize_title(&f.title))
 }
 
+static QUOTED_PARAM_RE: OnceLock<regex::Regex> = OnceLock::new();
+static PORT_RE: OnceLock<regex::Regex> = OnceLock::new();
+
 /// Normalize title: strip URL-specific parts, param names, port numbers
 fn normalize_title(title: &str) -> String {
     let lower = title.to_lowercase();
     // Remove parameter names in quotes (e.g., "SQLi in parameter 'id'" → "sqli in parameter")
-    let re = regex::Regex::new(r"'[^']*'").unwrap();
+    let re = QUOTED_PARAM_RE.get_or_init(|| regex::Regex::new(r"'[^']*'").unwrap());
     let cleaned = re.replace_all(&lower, "").to_string();
     // Remove port numbers
-    let re2 = regex::Regex::new(r":\d+").unwrap();
+    let re2 = PORT_RE.get_or_init(|| regex::Regex::new(r":\d+").unwrap());
     re2.replace_all(&cleaned, "").to_string().trim().to_string()
 }
 

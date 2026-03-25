@@ -180,7 +180,9 @@ sentinel
 
 ## 4. 설정 파일 (sentinel.toml)
 
-프로젝트 루트의 `sentinel.toml`로 기본값을 조정할 수 있다.
+> **주의**: `sentinel.toml` 파일은 현재 자동 로드되지 않는다. 모든 설정은 CLI 인자 또는 환경변수로 지정해야 한다. 설정 파일 로딩은 향후 버전에서 구현 예정이다.
+
+`sentinel.toml`은 향후 지원 예정인 설정 파일 형식이다. 아래는 지원될 구조의 참고 예시다.
 
 ```toml
 [scan]
@@ -195,7 +197,7 @@ file = "sentinel_report.json"
 format = "json"
 
 [http]
-user_agent = "Mozilla/5.0 (compatible; Sentinel/0.1.1)"
+user_agent = "Mozilla/5.0 (compatible; Sentinel/0.1.2)"
 follow_redirects = true
 max_redirects = 5
 
@@ -203,7 +205,7 @@ max_redirects = 5
 dir = "scripts"
 ```
 
-CLI 인자가 항상 설정 파일보다 우선한다.
+현재는 CLI 인자와 환경변수만 지원된다. 섹션 3의 환경변수 목록을 참고하라.
 
 ---
 
@@ -502,6 +504,8 @@ os.execute(...)   -- 시스템 명령 실행 불가 (os == nil)
 os.clock()        -- 시간 함수도 불가 (os == nil) → math.random() 사용
 require(...)      -- 외부 모듈 로드 불가
 loadfile(...)     -- 파일 로드 불가
+debug.getinfo()   -- 내부 Lua 상태 접근 불가 (debug == nil)
+load("code")      -- 런타임 코드 생성 불가 (load == nil)
 ```
 
 ### 예제 플러그인 모음

@@ -3,7 +3,7 @@ use futures::future::{join_all, select_ok};
 use regex::Regex;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use tracing::{debug, warn};
 
 use crate::core::scanner::{Finding, FindingCategory, ScanContext, Severity};
@@ -298,52 +298,54 @@ impl ResponseAnalyzer {
         urls: &[String],
         target_baseline_ms: u64,
     ) -> Result<Vec<Finding>> {
-        let mut all_findings = Vec::new();
-
-        for (idx, url) in urls.iter().enumerate() {
-            let parsed = match url::Url::parse(url) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            if parsed.query_pairs().count() == 0 {
-                continue; // param-less URLs handled by probe_common_params
-            }
-
-            // Reuse the base_resp elapsed_ms for the target (idx 0) to avoid
-            // an extra duplicate GET request (perf item ①).
-            let baseline_ms = if idx == 0 {
-                target_baseline_ms
-            } else {
-                match self.client.get(url).await {
-                    Ok(resp) => resp.elapsed_ms,
-                    Err(_) => 500, // conservative default
+        // Build one future per URL with query params; drive all concurrently.
+        let url_tasks: Vec<_> = urls
+            .iter()
+            .enumerate()
+            .filter(|(_, url)| {
+                url::Url::parse(url)
+                    .map(|p| p.query_pairs().count() > 0)
+                    .unwrap_or(false)
+            })
+            .map(|(idx, url)| {
+                let self_ = self; // &Self is Copy
+                let url = url.clone();
+                async move {
+                    let baseline_ms = if idx == 0 {
+                        target_baseline_ms
+                    } else {
+                        match self_.client.get(&url).await {
+                            Ok(resp) => resp.elapsed_ms,
+                            Err(_) => 500,
+                        }
+                    };
+                    let (sqli, traversal, cmdi, crlf, redirect, ssti) = tokio::join!(
+                        self_.check_sqli(&url, baseline_ms),
+                        self_.check_path_traversal(&url),
+                        self_.check_cmdi(&url, baseline_ms),
+                        self_.check_crlf(&url),
+                        self_.check_open_redirect(&url),
+                        self_.check_ssti(&url),
+                    );
+                    let mut v: Vec<Finding> = Vec::new();
+                    if let Ok(f) = sqli      { v.extend(f); }
+                    if let Ok(f) = traversal { v.extend(f); }
+                    if let Ok(f) = cmdi      { v.extend(f); }
+                    if let Ok(f) = crlf      { v.extend(f); }
+                    if let Ok(f) = redirect  { v.extend(f); }
+                    if let Ok(f) = ssti      { v.extend(f); }
+                    v
                 }
-            };
+            })
+            .collect();
 
-            let (sqli, traversal, cmdi, crlf, redirect, ssti) = tokio::join!(
-                self.check_sqli(url, baseline_ms),
-                self.check_path_traversal(url),
-                self.check_cmdi(url, baseline_ms),
-                self.check_crlf(url),
-                self.check_open_redirect(url),
-                self.check_ssti(url),
-            );
-            all_findings.extend(sqli?);
-            all_findings.extend(traversal?);
-            all_findings.extend(cmdi?);
-            all_findings.extend(crlf?);
-            all_findings.extend(redirect?);
-            all_findings.extend(ssti?);
-        }
-
-        Ok(all_findings)
+        let results = join_all(url_tasks).await;
+        Ok(results.into_iter().flatten().collect())
     }
 
     /// Probe common parameter names on param-less URLs
     async fn probe_common_params(&self, urls: &[String]) -> Result<Vec<Finding>> {
-        let mut findings = Vec::new();
-
-        let paramless: Vec<&String> = urls
+        let paramless: Vec<String> = urls
             .iter()
             .filter(|u| {
                 url::Url::parse(u)
@@ -351,100 +353,120 @@ impl ResponseAnalyzer {
                     .unwrap_or(false)
             })
             .take(5)
+            .cloned()
             .collect();
 
+        // SQLi + traversal: one task per (url × common_param), all concurrent
+        let mut param_tasks: Vec<_> = Vec::new();
         for url in &paramless {
-            let base = url.trim_end_matches('/');
-            for param in COMMON_PARAMS {
-                // SQLi probe: single quote
-                let test_url = format!("{}?{}='", base, param);
-                if !self.scope.is_in_scope(&test_url) {
-                    continue;
-                }
-                if let Ok(resp) = self.client.get(&test_url).await {
-                    let body_bytes = resp.body.as_bytes();
-                    for sig in SQL_ERROR_SIGS {
-                        if memmem_find_icase(body_bytes, sig) {
-                            let mut f = Finding::new(
-                                Severity::High,
-                                FindingCategory::SqlInjection,
-                                format!("SQLi via discovered parameter '{}'", param),
-                                format!(
-                                    "SQL error '{}' with payload \"'\" on probed param '{}'",
-                                    std::str::from_utf8(sig).unwrap_or("?"),
-                                    param
-                                ),
-                                test_url.clone(),
-                            );
-                            f.evidence = Some(format!("Param: {}, Payload: '", param));
-                            f.remediation = Some(
-                                "Use parameterized queries / prepared statements".to_string(),
-                            );
-                            findings.push(f);
-                            break;
-                        }
-                    }
-                }
+            let base = url.trim_end_matches('/').to_string();
+            for &param in COMMON_PARAMS {
+                let client = self.client.clone();
+                let scope  = self.scope.clone();
+                let base   = base.clone();
+                param_tasks.push(async move {
+                    let mut v: Vec<Finding> = Vec::new();
 
-                // Path traversal probe
-                let test_url = format!("{}?{}=../../etc/passwd", base, param);
-                if let Ok(resp) = self.client.get(&test_url).await {
-                    let body_bytes = resp.body.as_bytes();
-                    for sig in TRAVERSAL_SIGS {
-                        if memmem_find_icase(body_bytes, sig) {
-                            let mut f = Finding::new(
-                                Severity::High,
-                                FindingCategory::DirectoryTraversal,
-                                format!("Path Traversal via discovered parameter '{}'", param),
-                                format!(
-                                    "File content found with traversal payload on probed param '{}'",
-                                    param
-                                ),
-                                test_url.clone(),
-                            );
-                            f.evidence =
-                                Some(format!("Param: {}, Payload: ../../etc/passwd", param));
-                            f.remediation = Some(
-                                "Validate and sanitize file paths; use allowlists".to_string(),
-                            );
-                            findings.push(f);
-                            break;
+                    // SQLi probe: single quote
+                    let sqli_url = format!("{}?{}='", base, param);
+                    if scope.is_in_scope(&sqli_url) {
+                        if let Ok(resp) = client.get(&sqli_url).await {
+                            let body_lower: Vec<u8> = resp.body.as_bytes().iter()
+                                .map(|b| b.to_ascii_lowercase()).collect();
+                            for sig in SQL_ERROR_SIGS {
+                                if memmem_find_lower(&body_lower, sig) {
+                                    let mut f = Finding::new(
+                                        Severity::High,
+                                        FindingCategory::SqlInjection,
+                                        format!("SQLi via discovered parameter '{}'", param),
+                                        format!(
+                                            "SQL error '{}' with payload \"'\" on probed param '{}'",
+                                            std::str::from_utf8(sig).unwrap_or("?"),
+                                            param
+                                        ),
+                                        sqli_url.clone(),
+                                    );
+                                    f.evidence    = Some(format!("Param: {}, Payload: '", param));
+                                    f.remediation = Some("Use parameterized queries / prepared statements".to_string());
+                                    v.push(f);
+                                    break;
+                                }
+                            }
                         }
                     }
-                }
+
+                    // Path traversal probe
+                    let trav_url = format!("{}?{}=../../etc/passwd", base, param);
+                    if let Ok(resp) = client.get(&trav_url).await {
+                        let body_lower: Vec<u8> = resp.body.as_bytes().iter()
+                            .map(|b| b.to_ascii_lowercase()).collect();
+                        for sig in TRAVERSAL_SIGS {
+                            if memmem_find_lower(&body_lower, sig) {
+                                let mut f = Finding::new(
+                                    Severity::High,
+                                    FindingCategory::DirectoryTraversal,
+                                    format!("Path Traversal via discovered parameter '{}'", param),
+                                    format!(
+                                        "File content found with traversal payload on probed param '{}'",
+                                        param
+                                    ),
+                                    trav_url.clone(),
+                                );
+                                f.evidence    = Some(format!("Param: {}, Payload: ../../etc/passwd", param));
+                                f.remediation = Some("Validate and sanitize file paths; use allowlists".to_string());
+                                v.push(f);
+                                break;
+                            }
+                        }
+                    }
+
+                    v
+                });
             }
         }
 
-        // SSTI probe on param-less URLs (matches PortSwigger /?message= pattern)
+        // SSTI: one task per (url × ssti_param), payloads tried sequentially
+        // so only the first matching payload fires (preserves original break behaviour)
+        let mut ssti_tasks: Vec<_> = Vec::new();
         for url in &paramless {
-            let base = url.trim_end_matches('/');
-            for param in SSTI_PARAMS {
-                for (payload, expected) in SSTI_PAYLOADS {
-                    let test_url = format!("{}?{}={}", base, param, payload);
-                    if !self.scope.is_in_scope(&test_url) { continue; }
-                    if let Ok(resp) = self.client.get(&test_url).await {
-                        if resp.body.contains(expected) && !resp.body.contains(payload) {
-                            let mut f = Finding::new(
-                                Severity::Critical,
-                                FindingCategory::Custom,
-                                format!("SSTI via discovered parameter '{}'", param),
-                                format!(
-                                    "Template expression '{}' evaluated to '{}' on probed param '{}'",
-                                    payload, expected, param
-                                ),
-                                test_url.clone(),
-                            );
-                            f.evidence = Some(format!("Param: {}, Payload: {} → {}", param, payload, expected));
-                            f.remediation = Some(
-                                "Never render user input in templates. Use sandboxed engines.".to_string(),
-                            );
-                            findings.push(f);
-                            // Found SSTI — stop probing this URL
-                            break;
+            let base = url.trim_end_matches('/').to_string();
+            for &param in SSTI_PARAMS {
+                let client = self.client.clone();
+                let scope  = self.scope.clone();
+                let base   = base.clone();
+                ssti_tasks.push(async move {
+                    for &(payload, expected) in SSTI_PAYLOADS {
+                        let test_url = format!("{}?{}={}", base, param, payload);
+                        if !scope.is_in_scope(&test_url) { continue; }
+                        if let Ok(resp) = client.get(&test_url).await {
+                            if resp.body.contains(expected) && !resp.body.contains(payload) {
+                                let mut f = Finding::new(
+                                    Severity::Critical,
+                                    FindingCategory::Custom,
+                                    format!("SSTI via discovered parameter '{}'", param),
+                                    format!(
+                                        "Template expression '{}' evaluated to '{}' on probed param '{}'",
+                                        payload, expected, param
+                                    ),
+                                    test_url,
+                                );
+                                f.evidence    = Some(format!("Param: {}, Payload: {} → {}", param, payload, expected));
+                                f.remediation = Some("Never render user input in templates. Use sandboxed engines.".to_string());
+                                return Some(f);
+                            }
                         }
                     }
-                }
+                    None
+                });
             }
+        }
+
+        let mut findings: Vec<Finding> = Vec::new();
+        for v in join_all(param_tasks).await {
+            findings.extend(v);
+        }
+        for opt in join_all(ssti_tasks).await {
+            if let Some(f) = opt { findings.push(f); }
         }
 
         Ok(findings)
@@ -572,10 +594,9 @@ impl ResponseAnalyzer {
             Ok(p) => p,
             Err(_) => return Ok(vec![]),
         };
-        let original_query: Vec<(String, String)> = parsed
-            .query_pairs()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
+        let original_query: Arc<Vec<(String, String)>> = Arc::new(
+            parsed.query_pairs().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        );
         if original_query.is_empty() {
             return Ok(vec![]);
         }
@@ -586,7 +607,7 @@ impl ResponseAnalyzer {
                 let client     = self.client.clone();
                 let scope      = self.scope.clone();
                 let param_name = param_name.clone();
-                let orig_query = original_query.clone();
+                let orig_query = Arc::clone(&original_query);
                 let url_str    = url.to_string();
                 let thorough = self.ctx.config.thorough;
                 async move {
@@ -605,10 +626,9 @@ impl ResponseAnalyzer {
             Ok(p) => p,
             Err(_) => return Ok(vec![]),
         };
-        let original_query: Vec<(String, String)> = parsed
-            .query_pairs()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
+        let original_query: Arc<Vec<(String, String)>> = Arc::new(
+            parsed.query_pairs().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        );
         if original_query.is_empty() {
             return Ok(vec![]);
         }
@@ -619,7 +639,7 @@ impl ResponseAnalyzer {
                 let client     = self.client.clone();
                 let scope      = self.scope.clone();
                 let param_name = param_name.clone();
-                let orig_query = original_query.clone();
+                let orig_query = Arc::clone(&original_query);
                 let url_str    = url.to_string();
                 async move {
                     traversal_probe_param(client, scope, url_str, param_name, orig_query).await
@@ -637,10 +657,9 @@ impl ResponseAnalyzer {
             Ok(p) => p,
             Err(_) => return Ok(vec![]),
         };
-        let original_query: Vec<(String, String)> = parsed
-            .query_pairs()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
+        let original_query: Arc<Vec<(String, String)>> = Arc::new(
+            parsed.query_pairs().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        );
         if original_query.is_empty() {
             return Ok(vec![]);
         }
@@ -651,7 +670,7 @@ impl ResponseAnalyzer {
                 let client     = self.client.clone();
                 let scope      = self.scope.clone();
                 let param_name = param_name.clone();
-                let orig_query = original_query.clone();
+                let orig_query = Arc::clone(&original_query);
                 let url_str    = url.to_string();
                 async move {
                     cmdi_probe_param(client, scope, url_str, param_name, orig_query, baseline_ms).await
@@ -1115,7 +1134,7 @@ async fn sqli_probe_param(
     scope: ScopeGuard,
     url: String,
     param_name: String,
-    original_query: Vec<(String, String)>,
+    original_query: Arc<Vec<(String, String)>>,
     baseline_ms: u64,
     thorough: bool,
 ) -> Vec<Finding> {
@@ -1134,9 +1153,9 @@ async fn sqli_probe_param(
             if !scope.is_in_scope(&test_url) { continue; }
 
             if let Ok(resp) = client.get(&test_url).await {
-                let body_bytes = resp.body.as_bytes();
+                let body_lower: Vec<u8> = resp.body.as_bytes().iter().map(|b| b.to_ascii_lowercase()).collect();
                 for sig in SQL_ERROR_SIGS {
-                    if memmem_find_icase(body_bytes, sig) {
+                    if memmem_find_lower(&body_lower, sig) {
                         let evasion_note = if strategy != EvasionStrategy::None {
                             format!(" (WAF bypass: {:?})", strategy)
                         } else {
@@ -1214,7 +1233,7 @@ async fn traversal_probe_param(
     scope: ScopeGuard,
     url: String,
     param_name: String,
-    original_query: Vec<(String, String)>,
+    original_query: Arc<Vec<(String, String)>>,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
 
@@ -1224,9 +1243,9 @@ async fn traversal_probe_param(
         if !scope.is_in_scope(&test_url) { continue; }
 
         if let Ok(resp) = client.get(&test_url).await {
-            let body_bytes = resp.body.as_bytes();
+            let body_lower: Vec<u8> = resp.body.as_bytes().iter().map(|b| b.to_ascii_lowercase()).collect();
             for sig in TRAVERSAL_SIGS {
-                if memmem_find_icase(body_bytes, sig) {
+                if memmem_find_lower(&body_lower, sig) {
                     debug!("Path traversal at {} param={}", url, param_name);
                     let mut f = Finding::new(
                         Severity::High,
@@ -1257,7 +1276,7 @@ async fn cmdi_probe_param(
     scope: ScopeGuard,
     url: String,
     param_name: String,
-    original_query: Vec<(String, String)>,
+    original_query: Arc<Vec<(String, String)>>,
     baseline_ms: u64,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
@@ -1540,6 +1559,14 @@ fn memmem_find_icase(haystack: &[u8], needle: &[u8]) -> bool {
     // For larger bodies, heap-allocate the lowercase copy
     let lower: Vec<u8> = haystack.iter().map(|b| b.to_ascii_lowercase()).collect();
     memchr::memmem::find(&lower, needle).is_some()
+}
+
+/// Search a **pre-lowercased** haystack — no allocation, just the memmem search.
+/// Use when searching the same response body against many needles.
+/// Needle must already be lowercase.
+#[inline]
+fn memmem_find_lower(pre_lowered: &[u8], needle: &[u8]) -> bool {
+    memchr::memmem::find(pre_lowered, needle).is_some()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
