@@ -15,6 +15,7 @@ scans/
 .vscode/
 *.swp
 *.swo
+.omc/
 
 # OS
 .DS_Store
