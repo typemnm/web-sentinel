@@ -39,6 +39,10 @@ pub struct ScanConfig {
     pub max_crawl_urls: usize,
     /// Thorough mode: more evasion variants, slower but deeper
     pub thorough: bool,
+    /// Enable LLM-assisted analysis phase (opt-in via --llm flag)
+    pub llm_enabled: bool,
+    /// LLM configuration (loaded from [llm] in sentinel.toml, overridable via CLI)
+    pub llm_config: crate::llm::config::LlmConfig,
 }
 
 /// Shared scan context (passed via Arc to all async tasks)
@@ -123,6 +127,10 @@ pub enum FindingCategory {
     Cors,
     InformationDisclosure,
     Custom,
+    /// Confirmed exploit: LLM-generated attack executed and matched success indicator
+    LlmExploit,
+    /// LLM analysis suggestion: dry-run mode, or attack ran but did not confirm
+    LlmAnalysis,
 }
 
 #[cfg(test)]
@@ -149,6 +157,8 @@ mod tests {
             max_crawl_depth: 3,
             max_crawl_urls: 100,
             thorough: false,
+            llm_enabled: false,
+            llm_config: crate::llm::config::LlmConfig::default(),
         };
 
         let ctx = ScanContext::new(config);

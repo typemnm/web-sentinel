@@ -6,6 +6,7 @@ use tracing::{error, info};
 mod browser;
 mod core;
 mod db;
+mod llm;
 mod network;
 mod report;
 mod scripting;
@@ -101,6 +102,22 @@ pub struct Cli {
     /// Thorough scan mode: more evasion variants, deeper checks (slower)
     #[arg(long)]
     pub thorough: bool,
+
+    /// Enable LLM-assisted vulnerability analysis (Phase 7)
+    #[arg(long)]
+    pub llm: bool,
+
+    /// LLM dry-run: generate attack payloads but don't execute them
+    #[arg(long)]
+    pub llm_dry_run: bool,
+
+    /// LLM provider base URL, e.g. http://localhost:11434/v1 for Ollama
+    #[arg(long, env = "SENTINEL_LLM_API_BASE")]
+    pub llm_api_base: Option<String>,
+
+    /// LLM model name, e.g. gpt-4o-mini or llama3
+    #[arg(long, env = "SENTINEL_LLM_MODEL")]
+    pub llm_model: Option<String>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -160,6 +177,21 @@ async fn main() -> Result<()> {
         AuthMethod::None
     };
 
+    // Build LLM config: defaults, then apply CLI overrides
+    let mut llm_config = llm::config::LlmConfig::default();
+    if cli.llm {
+        llm_config.enabled = true;
+    }
+    if cli.llm_dry_run {
+        llm_config.dry_run = true;
+    }
+    if let Some(base) = cli.llm_api_base {
+        llm_config.api_base = base;
+    }
+    if let Some(model) = cli.llm_model {
+        llm_config.model = model;
+    }
+
     let scan_config = ScanConfig {
         target: target.clone(),
         output: cli.output.clone(),
@@ -178,6 +210,8 @@ async fn main() -> Result<()> {
         max_crawl_depth: cli.crawl_depth,
         max_crawl_urls: cli.crawl_max_urls,
         thorough: cli.thorough,
+        llm_enabled: llm_config.enabled,
+        llm_config,
     };
 
     let mut orchestrator = Orchestrator::new(scan_config).await?;

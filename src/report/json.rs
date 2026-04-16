@@ -12,6 +12,8 @@ pub struct ScanReport {
     pub scan_timestamp: chrono::DateTime<chrono::Utc>,
     pub summary: ReportSummary,
     pub findings: Vec<Finding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_stats: Option<crate::llm::types::LlmStats>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -49,13 +51,19 @@ impl ReportWriter {
         Self { output }
     }
 
-    pub async fn write(&self, target: &str, findings: &[Finding]) -> Result<()> {
+    pub async fn write(
+        &self,
+        target: &str,
+        findings: &[Finding],
+        llm_stats: Option<&crate::llm::types::LlmStats>,
+    ) -> Result<()> {
         let report = ScanReport {
             sentinel_version: env!("CARGO_PKG_VERSION").to_string(),
             target: target.to_string(),
             scan_timestamp: chrono::Utc::now(),
             summary: ReportSummary::from_findings(findings),
             findings: findings.to_vec(),
+            llm_stats: llm_stats.cloned(),
         };
 
         let json = serde_json::to_string_pretty(&report)?;
@@ -97,7 +105,7 @@ mod tests {
         ];
 
         let writer = ReportWriter::new(out.clone());
-        writer.write("http://example.com", &findings).await.unwrap();
+        writer.write("http://example.com", &findings, None).await.unwrap();
 
         // Parse back and verify
         let content = tokio::fs::read_to_string(&out).await.unwrap();

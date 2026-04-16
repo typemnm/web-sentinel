@@ -174,6 +174,31 @@ impl Orchestrator {
             }
         }
 
+        // Phase 7: LLM-assisted analysis (opt-in via --llm)
+        let mut llm_stats: Option<crate::llm::types::LlmStats> = None;
+        if self.ctx.config.llm_enabled {
+            info!("[Phase 7] LLM-assisted vulnerability analysis...");
+            let llm_scope = ScopeGuard::new(&self.ctx.config.scope);
+            match crate::llm::LlmPhase::run(
+                &self.ctx.config,
+                &all_findings,
+                &http_client,
+                &llm_scope,
+            ).await {
+                Ok(output) => {
+                    info!(
+                        "LLM phase: {} analyzed, {} attacks generated, {} confirmed",
+                        output.stats.findings_analyzed,
+                        output.stats.attacks_generated,
+                        output.stats.attacks_confirmed,
+                    );
+                    all_findings.extend(output.new_findings);
+                    llm_stats = Some(output.stats);
+                }
+                Err(e) => warn!("LLM phase error (non-fatal): {:#}", e),
+            }
+        }
+
         // Enrich findings: add tech-stack context to descriptions when relevant
         let all_findings: Vec<Finding> = all_findings.into_iter().map(|mut f| {
             let combined = format!("{} {}", f.title.to_lowercase(), f.description.to_lowercase());
@@ -205,7 +230,7 @@ impl Orchestrator {
         // 리포트 작성
         info!("Scan complete. {} findings.", all_findings.len());
         let writer = ReportWriter::new(self.ctx.config.output.clone());
-        writer.write(&target, &all_findings).await?;
+        writer.write(&target, &all_findings, llm_stats.as_ref()).await?;
         info!("Report written to: {}", self.ctx.config.output.display());
 
         state.set("scan:status", "done")?;

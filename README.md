@@ -143,6 +143,10 @@ Options:
       --thorough             Thorough mode: 9 WAF evasion variants (slower, deeper)
       --crawl-depth <N>      Max recursive crawl depth [default: 3]
       --crawl-max-urls <N>   Max URLs to visit         [default: 100]
+        --llm                  Enable LLM-assisted analysis (Phase 7)
+        --llm-dry-run          Generate payloads only; do not execute attacks
+        --llm-api-base <URL>   OpenAI-compatible API base URL
+        --llm-model <NAME>     LLM model name (e.g. gpt-4o-mini, llama3)
       --cookie <COOKIE>      Auth cookie (e.g. "session=abc123")
       --token <TOKEN>        Bearer token for Authorization header
       --basic-auth <U:P>     Basic auth credentials ("user:pass")
@@ -171,7 +175,40 @@ sentinel --target $DEPLOY_URL --silent -o /tmp/report.json
 
 # Deep crawl with custom limits
 sentinel --target https://target.com --crawl-depth 5 --crawl-max-urls 500
+
+# Enable LLM Phase 7 with OpenAI-compatible API
+sentinel --target https://target.com --llm --llm-model gpt-4o-mini
+
+# Safe preview mode: generate attack specs without execution
+sentinel --target https://target.com --llm --llm-dry-run
 ```
+
+---
+
+## LLM Phase 7 (Optional)
+
+Phase 7 adds an opt-in LLM-assisted post-analysis stage after the core scan phases.
+
+- Input: findings from Phases 1-6
+- LLM output: structured attack specs per finding
+- Execution: scoped HTTP replay through Sentinel's existing rate limiter and scope guard
+- Result: additional findings (`llm_exploit`, `llm_analysis`) + `llm_stats` in JSON report
+
+Example:
+
+```bash
+# OpenAI-compatible endpoint (default)
+export SENTINEL_LLM_API_KEY="<your-api-key>"
+sentinel --target https://example.com --llm --llm-model gpt-4o-mini
+
+# Local Ollama
+sentinel --target https://example.com \
+    --llm \
+    --llm-api-base http://localhost:11434/v1 \
+    --llm-model llama3
+```
+
+`--llm-dry-run` keeps Phase 7 non-invasive by generating payloads without sending attack requests.
 
 ---
 
@@ -233,8 +270,10 @@ flowchart TD
     P45 --> LUA["Lua Engine (28 scripts)\nspawn_blocking × N"]
 
     ORC --> P6["Phase 6 (--browser)\nHeadless Chrome XSS\nMutationObserver + Polyglots"]
+    ORC --> P7["Phase 7 (--llm)\nLLM Analysis + Attack Replay\nScoped + Rate-limited"]
 
     ORC --> ENRICH["Tech → Vuln Linking"]
+    P7 --> ENRICH
     ENRICH --> DEDUP["Finding Dedup\nSame-URL merge + Cross-URL aggregation"]
     DEDUP --> RPT["JSON Report\nseverity-sorted"]
 ```
@@ -342,6 +381,7 @@ MIT License - see LICENSE file for details
 
 - [Overview](docs/overview.md) — Architecture, design principles, roadmap
 - [User Guide](docs/user-guide.md) — Installation, CLI reference, Lua API, troubleshooting
+- [LLM Plugin Guide](docs/llm-plugin.md) — Phase 7 setup, provider config, dry-run, security notes
 - [Performance & Accuracy](docs/performance-improvements.md) — 19 optimization items (18 implemented)
-- [Scan Results: Juice Shop](docs/scan-results-juiceshop.md) — OWASP Juice Shop scan report (v0.1.1)
+- [Scan Results: Juice Shop](docs/scan-results-juiceshop.md) — OWASP Juice Shop scan report (v0.2.0)
 - [Contributing](CONTRIBUTING.md) — Lua script contribution guide, PR checklist, wishlist

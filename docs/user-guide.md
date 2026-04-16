@@ -197,7 +197,7 @@ file = "sentinel_report.json"
 format = "json"
 
 [http]
-user_agent = "Mozilla/5.0 (compatible; Sentinel/0.1.2)"
+user_agent = "Mozilla/5.0 (compatible; Sentinel/0.2.0)"
 follow_redirects = true
 max_redirects = 5
 
@@ -353,7 +353,7 @@ sentinel \
 
 ### 시나리오 10: SPA (Single Page Application) 스캔
 
-Angular, React, Vue.js 등 SPA는 서버사이드 라우팅이 없어 일반 크롤러로는 API 엔드포인트를 발견하기 어렵다. Sentinel v0.1.1은 SPA에 최적화된 스캔을 제공한다.
+Angular, React, Vue.js 등 SPA는 서버사이드 라우팅이 없어 일반 크롤러로는 API 엔드포인트를 발견하기 어렵다. Sentinel v0.2.0은 SPA에 최적화된 스캔을 제공한다.
 
 ```bash
 sentinel \
@@ -582,7 +582,7 @@ end
 
 ```json
 {
-  "sentinel_version": "0.1.1",
+  "sentinel_version": "0.2.0",
   "target": "http://example.com",
   "scan_timestamp": "2026-03-20T10:30:00Z",
   "summary": {

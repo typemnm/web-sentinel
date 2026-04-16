@@ -489,6 +489,21 @@ sentinel --target https://api.com --auth-header "X-API-Key:sk-12345"
 | 미사용 `config` 크레이트 제거 | 정리 | ✅ `Cargo.toml` |
 | Finding 보강 로직 불변 변환 (`into_iter().map()`) | 코드 품질 | ✅ `orchestrator.rs` |
 
+#### v0.2.0 (2026-03-29)
+
+| 항목 | 분류 | 상태 |
+|------|------|------|
+| LLM 모델, 한계 등 설정 | 성능 | ✅ `config.rs` |
+| 공격 리포트 명세화용 타입 모음 | 성능 | ✅ `type.rs` |
+| 시스템 프롬프트 및 공격용 프롬프트 빌더 | 성능 | ✅ `prompt.rs` |
+| LLM 통신용 provider | 성능 | ✅ `provider.rs` |
+| LLM 분석 결과를 바탕으로 HTTP 공격 수행 | 성능 | ✅ `executor.rs` |
+| llm 활성화 및 분석 카테고리 추가 | 성능 | ✅ `scanner.rs` |
+| phase 7 추가 | 성능 | ✅ `orchestrator.rs` |
+| llm 사용을 위한 cli 옵션 추가 | 성능 | ✅ `main.rs` |
+| llm_stats 필드 추가 | 성능 | ✅ `report/json.rs` |
+| llm 설정 영역 문서화 | 성능 | ✅ `sentinel.toml` |
+
 ### 향후 로드맵
 
 | 우선순위 | 항목 |

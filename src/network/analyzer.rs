@@ -1600,6 +1600,8 @@ mod tests {
             max_crawl_depth: 3,
             max_crawl_urls: 100,
             thorough: false,
+            llm_enabled: false,
+            llm_config: crate::llm::config::LlmConfig::default(),
         })
     }
 

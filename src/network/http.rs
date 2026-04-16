@@ -244,6 +244,8 @@ mod tests {
             max_crawl_depth: 3,
             max_crawl_urls: 100,
             thorough: false,
+            llm_enabled: false,
+            llm_config: crate::llm::config::LlmConfig::default(),
         })
     }
 
@@ -264,6 +266,8 @@ mod tests {
             max_crawl_depth: 3,
             max_crawl_urls: 100,
             thorough: false,
+            llm_enabled: false,
+            llm_config: crate::llm::config::LlmConfig::default(),
         });
         let client = HttpClient::new(&ctx);
         assert!(client.is_ok());

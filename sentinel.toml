@@ -13,7 +13,7 @@ file = "sentinel_report.json"
 format = "json"
 
 [http]
-user_agent = "Mozilla/5.0 (compatible; Sentinel/0.1.0)"
+user_agent = "Mozilla/5.0 (compatible; Sentinel/0.2.0)"
 follow_redirects = true
 max_redirects = 5
 
@@ -24,3 +24,30 @@ extra = []
 
 [scripts]
 dir = "scripts"
+
+# LLM-assisted vulnerability analysis (Phase 7)
+# Opt-in: enable via --llm flag or set enabled = true here
+[llm]
+enabled = false
+provider = "openai-compat"
+# OpenAI: "https://api.openai.com/v1"
+# Ollama: "http://localhost:11434/v1"
+# vLLM:   "http://localhost:8000/v1"
+api_base = "https://api.openai.com/v1"
+model = "gpt-4o-mini"
+# API key: set here or via SENTINEL_LLM_API_KEY env var
+# Leave empty for local servers (Ollama, llama.cpp) that need no auth
+api_key = ""
+api_timeout_secs = 120
+max_tokens = 2048
+temperature = 0.2
+# Only analyze findings at or above this severity: info, low, medium, high, critical
+min_severity = "high"
+# Maximum findings to send to LLM per scan (cost control)
+max_findings = 20
+# Maximum attack payloads generated per finding
+max_attacks_per_finding = 5
+# Dry-run: generate payloads but don't execute them (safe preview mode)
+dry_run = false
+# Max chars of evidence included in prompts (prompt injection mitigation)
+max_evidence_chars = 4096
