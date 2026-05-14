@@ -105,6 +105,7 @@ mod tests {
             thorough: false,
             llm_enabled: false,
             llm_config: crate::llm::config::LlmConfig::default(),
+            no_scripts: false,
         })
     }
 

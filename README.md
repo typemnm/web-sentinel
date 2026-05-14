@@ -34,7 +34,7 @@ sentinel --target https://example.com
 [✓] Auth Support       — Cookie / Bearer / Basic / Custom header
 [✓] Finding Dedup      — Same-URL merge + cross-URL low/info aggregation
 [✓] Lua Plugins (28)   — SSRF, SSTI, JWT, NoSQL, XXE, IDOR, deserialization...
-[✓] DOM XSS            — alert() + MutationObserver via headless Chrome
+[✓] DOM XSS            — alert() + MutationObserver via obscura browser
 
 Report → sentinel_report.json (deduplicated, severity-sorted)
 ```
@@ -46,7 +46,7 @@ Report → sentinel_report.json (deduplicated, severity-sorted)
 | | Nuclei | OWASP ZAP | Sentinel |
 |---|---|---|---|
 | Runtime | Go binary | JVM (500MB+) | **Rust — 14MB single binary** |
-| XSS verification | Template match | Proxy-based | **Real JS execution (headless Chrome)** |
+| XSS verification | Template match | Proxy-based | **Real JS execution (obscura browser)** |
 | Extensibility | YAML templates | Groovy scripts | **Lua — hot-reload, no recompile** |
 | False positives | Medium | Low | **Low (alert() confirmed)** |
 | CI/CD fit | ✅ | ❌ (GUI-heavy) | ✅ |
@@ -78,7 +78,7 @@ Report → sentinel_report.json (deduplicated, severity-sorted)
 | **Common Param Probing** | Guess `id`, `q`, `file`, `path` etc. + SSTI params on param-less URLs | High–Critical |
 | **Form Injection** | POST/GET form fields tested for SQLi + CMDi (parallelized with `join_all`) | High–Critical |
 | **Body Pattern Analysis** | HTML comments, hidden inputs, internal IPs, error traces | Low–Medium |
-| **DOM XSS** | `<script>`, `<img onerror>`, `<svg onload>` + MutationObserver + 8 polyglot payloads via headless Chrome | High |
+| **DOM XSS** | `<script>`, `<img onerror>`, `<svg onload>` + MutationObserver + 8 polyglot payloads via obscura browser | High |
 | **Reflected XSS** | URL parameter injection, JS alert() verified | High |
 | **Finding Dedup** | Same-URL merge (keep highest severity), cross-URL low/info aggregation, evidence truncation | — |
 | **Rate Limiting** | Governor-backed per-second rate limiter enforcing `--rps` | — |
@@ -122,7 +122,7 @@ cd web-sentinel
 make install      # builds release binary → /usr/local/bin/sentinel
 ```
 
-Requires: Rust 1.75+, Chromium (for `--browser` only)
+Requires: Rust 1.75+ (no Chromium install needed — obscura bundles its own browser engine)
 
 ---
 
@@ -136,7 +136,7 @@ Options:
   -o, --output <FILE>        JSON report path        [default: sentinel_report.json]
       --threads <N>          Concurrency             [default: 50]
       --rps <N>              Requests/second          [default: 10]
-      --browser              Enable headless Chrome XSS scan
+      --browser              Enable obscura browser XSS scan
       --no-ports             Skip port scan
       --scope <DOMAIN>       Restrict scope (supports *.domain)
       --timeout <SEC>        Request timeout          [default: 10]
@@ -161,7 +161,7 @@ Options:
 # Fast HTTP-only check (no port scan)
 sentinel --target https://target.com --no-ports --rps 30
 
-# Full deep scan with browser XSS + thorough WAF evasion
+# Full deep scan with obscura browser XSS + thorough WAF evasion
 sentinel --target http://internal-app.local --browser --thorough --rps 5 -vv
 
 # Scoped scan (allow subdomains)
@@ -269,7 +269,7 @@ flowchart TD
     P45 --> ANA["HTTP Analyzer\nSQLi / Traversal / CMDi / SSTI / CRLF\nWAF Evasion / Forms / Param Probe"]
     P45 --> LUA["Lua Engine (28 scripts)\nspawn_blocking × N"]
 
-    ORC --> P6["Phase 6 (--browser)\nHeadless Chrome XSS\nMutationObserver + Polyglots"]
+    ORC --> P6["Phase 6 (--browser)\nObscura Browser XSS\nMutationObserver + Polyglots"]
     ORC --> P7["Phase 7 (--llm)\nLLM Analysis + Attack Replay\nScoped + Rate-limited"]
 
     ORC --> ENRICH["Tech → Vuln Linking"]
@@ -374,6 +374,41 @@ See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the full guide, PR checklist, and
 ## License
 
 MIT License - see LICENSE file for details
+
+---
+
+## Bug Bounty
+
+Sentinel was used to scan Naver Bug Bounty targets (`developers.naver.com`, `search.naver.com`) with Gemma 3 27B (via Ollama) as the LLM analysis backend.
+
+### Results Summary
+
+| Target | Findings | Highest Severity | Notable |
+|--------|----------|-----------------|---------|
+| developers.naver.com | 6 | Medium | TRACE method enabled, 4 missing headers |
+| search.naver.com | 6 | Low | X-Frame-Options missing (clickjacking), 4 missing headers |
+
+### LLM Integration (Gemma 3 27B)
+
+```toml
+[llm]
+enabled = true
+provider = "openai-compat"
+api_base = "http://localhost:11434/v1"
+model = "gemma3:27b"
+api_timeout_secs = 180
+min_severity = "high"
+```
+
+Gemma 3 27B is served locally via Ollama. It analyzes High/Critical findings in Phase 7 and generates targeted attack payloads. The Naver scans produced only Low/Medium findings — below the `min_severity = "high"` threshold — so LLM phase was not triggered.
+
+### Full Reports
+
+- [Bug Bounty Report](docs/bugbounty-report.md) — Full process documentation
+- [Recon Findings](docs/bugbounty-recon.md) — Per-target scan results
+- [Target Analysis](docs/bugbounty-targets.md) — Naver program scope and reward table
+- [Gemma4 Integration](docs/gemma4-integration.md) — LLM setup guide
+- [Functional Audit](docs/functional-audit.md) — 2 bugs fixed, 8 issues documented
 
 ---
 

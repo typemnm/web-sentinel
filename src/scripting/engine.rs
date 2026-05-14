@@ -118,6 +118,21 @@ fn resp_to_lua_table(lua_ctx: &Lua, r: &crate::network::http::HttpResponse) -> m
         hdrs.set(k.clone(), v.clone())?;
     }
     tbl.set("headers", hdrs)?;
+    tbl.set("error", mlua::Value::Nil)?;
+    Ok(mlua::Value::Table(tbl))
+}
+
+/// Build an error-state response table so HTTP failures don't abort scripts.
+/// Scripts can check `if resp.error then ... end` or `if resp.status == 0 then ... end`.
+fn resp_err_to_lua_table(lua_ctx: &Lua, url: &str, msg: &str) -> mlua::Result<mlua::Value> {
+    warn!("Lua HTTP error (non-fatal): {}", msg);
+    let tbl = lua_ctx.create_table()?;
+    tbl.set("status", 0u16)?;
+    tbl.set("body", "")?;
+    tbl.set("url", url)?;
+    tbl.set("elapsed_ms", 0u64)?;
+    tbl.set("headers", lua_ctx.create_table()?)?;
+    tbl.set("error", msg)?;
     Ok(mlua::Value::Table(tbl))
 }
 
@@ -141,12 +156,10 @@ fn setup_sandbox(
     let client_get = client.clone();
     let get_fn = lua_err!(lua.create_function(move |lua_ctx, url: String| {
         let client = client_get.clone();
-        let resp = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(client.get(&url))
-        });
+        let resp = tokio::runtime::Handle::current().block_on(client.get(&url));
         match resp {
-            Ok(r) => resp_to_lua_table(&lua_ctx, &r),
-            Err(e) => Err(mlua::Error::external(format!("http.get: {}", e))),
+            Ok(r)  => resp_to_lua_table(&lua_ctx, &r),
+            Err(e) => resp_err_to_lua_table(&lua_ctx, &url, &format!("http.get: {e}")),
         }
     }))?;
     lua_err!(http_table.set("get", get_fn))?;
@@ -155,12 +168,10 @@ fn setup_sandbox(
     let client_post = client.clone();
     let post_fn = lua_err!(lua.create_function(move |lua_ctx, (url, body): (String, String)| {
         let client = client_post.clone();
-        let resp = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(client.post(&url, &body))
-        });
+        let resp = tokio::runtime::Handle::current().block_on(client.post(&url, &body));
         match resp {
-            Ok(r) => resp_to_lua_table(&lua_ctx, &r),
-            Err(e) => Err(mlua::Error::external(format!("http.post: {}", e))),
+            Ok(r)  => resp_to_lua_table(&lua_ctx, &r),
+            Err(e) => resp_err_to_lua_table(&lua_ctx, &url, &format!("http.post: {e}")),
         }
     }))?;
     lua_err!(http_table.set("post", post_fn))?;
@@ -169,12 +180,10 @@ fn setup_sandbox(
     let client_post_json = client.clone();
     let post_json_fn = lua_err!(lua.create_function(move |lua_ctx, (url, body): (String, String)| {
         let client = client_post_json.clone();
-        let resp = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(client.post_json(&url, &body))
-        });
+        let resp = tokio::runtime::Handle::current().block_on(client.post_json(&url, &body));
         match resp {
-            Ok(r) => resp_to_lua_table(&lua_ctx, &r),
-            Err(e) => Err(mlua::Error::external(format!("http.post_json: {}", e))),
+            Ok(r)  => resp_to_lua_table(&lua_ctx, &r),
+            Err(e) => resp_err_to_lua_table(&lua_ctx, &url, &format!("http.post_json: {e}")),
         }
     }))?;
     lua_err!(http_table.set("post_json", post_json_fn))?;
@@ -183,12 +192,10 @@ fn setup_sandbox(
     let client_head = client.clone();
     let head_fn = lua_err!(lua.create_function(move |lua_ctx, url: String| {
         let client = client_head.clone();
-        let resp = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(client.head(&url))
-        });
+        let resp = tokio::runtime::Handle::current().block_on(client.head(&url));
         match resp {
-            Ok(r) => resp_to_lua_table(&lua_ctx, &r),
-            Err(e) => Err(mlua::Error::external(format!("http.head: {}", e))),
+            Ok(r)  => resp_to_lua_table(&lua_ctx, &r),
+            Err(e) => resp_err_to_lua_table(&lua_ctx, &url, &format!("http.head: {e}")),
         }
     }))?;
     lua_err!(http_table.set("head", head_fn))?;
@@ -204,16 +211,13 @@ fn setup_sandbox(
                 extra.push((k, v));
             }
         }
-        let resp = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                // Convert to &str pairs for the API
-                let refs: Vec<(&str, &str)> = extra.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                client.get_with_headers(&url, &refs).await
-            })
+        let resp = tokio::runtime::Handle::current().block_on(async {
+            let refs: Vec<(&str, &str)> = extra.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            client.get_with_headers(&url, &refs).await
         });
         match resp {
-            Ok(r) => resp_to_lua_table(&lua_ctx, &r),
-            Err(e) => Err(mlua::Error::external(format!("http.get_with_headers: {}", e))),
+            Ok(r)  => resp_to_lua_table(&lua_ctx, &r),
+            Err(e) => resp_err_to_lua_table(&lua_ctx, &url, &format!("http.get_with_headers: {e}")),
         }
     }))?;
     lua_err!(http_table.set("get_with_headers", gwh_fn))?;
@@ -319,6 +323,7 @@ mod tests {
             thorough: false,
             llm_enabled: false,
             llm_config: crate::llm::config::LlmConfig::default(),
+            no_scripts: false,
         })
     }
 
@@ -387,5 +392,32 @@ mod tests {
         let findings = engine.run_all("http://example.com").await.unwrap();
         // 스크립트 3개 → finding 3개
         assert_eq!(findings.len(), 3);
+    }
+
+    /// HTTP failure must return an error-state table (status=0, error field set)
+    /// rather than aborting the script with a Lua error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lua_http_error_returns_table_not_abort() {
+        let dir = tempdir().unwrap();
+        // Script hits an unreachable host; must NOT abort — it reads resp.error and reports a finding.
+        std::fs::write(
+            dir.path().join("http_err.lua"),
+            r#"
+local resp = http.get("http://127.0.0.1:19999/unreachable")
+if resp.status == 0 and resp.error then
+    report.finding("info", "custom", "HTTP error handled", resp.error, TARGET)
+end
+"#,
+        )
+        .unwrap();
+
+        let ctx    = make_ctx(dir.path().to_path_buf());
+        let client = HttpClient::new(&ctx).unwrap();
+        let mut engine = ScriptEngine::new(ctx, client).await.unwrap();
+
+        let findings = engine.run_all("http://example.com").await.unwrap();
+        // Script must complete and report the error-handled finding (not abort silently)
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].title, "HTTP error handled");
     }
 }

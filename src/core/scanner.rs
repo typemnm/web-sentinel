@@ -43,6 +43,8 @@ pub struct ScanConfig {
     pub llm_enabled: bool,
     /// LLM configuration (loaded from [llm] in sentinel.toml, overridable via CLI)
     pub llm_config: crate::llm::config::LlmConfig,
+    /// Skip Lua script phase entirely (§1.2)
+    pub no_scripts: bool,
 }
 
 /// Shared scan context (passed via Arc to all async tasks)
@@ -159,6 +161,7 @@ mod tests {
             thorough: false,
             llm_enabled: false,
             llm_config: crate::llm::config::LlmConfig::default(),
+            no_scripts: false,
         };
 
         let ctx = ScanContext::new(config);

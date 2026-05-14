@@ -1,7 +1,7 @@
 # Project Sentinel — 개요 문서
 
 > CERT용 웹 취약점 진단 소프트웨어
-> 버전: 0.1.0 | 언어: Rust | 라이선스: MIT
+> 버전: 0.3.0 | 언어: Rust | 라이선스: MIT
 
 ---
 
@@ -41,7 +41,7 @@ Sentinel은 이 세 도구의 장점을 하나로 통합한다.
 Fast Layer  ─── reqwest (HTTP/1.1 + HTTP/2, Connection Pool)
                  └─ 헤더 분석, SQLi 탐지, 쿠키 검사, 리디렉션 추적
 
-Deep Layer  ─── headless_chrome (DevTools Protocol)
+Deep Layer  ─── obscura-browser (lightweight Rust browser engine)
                  └─ DOM 조작, JS 실행 감지, Reflected XSS 확인
 ```
 
@@ -156,7 +156,7 @@ Orchestrator::run()
     │   └─ Phase 5: Lua 스크립트 실행 (28개)
     │               (scripts/*.lua 파일 → spawn_blocking 병렬)
     │
-    ├─ Phase 6: 헤드리스 브라우저 XSS 탐지 (--browser 옵션 시)
+    ├─ Phase 6: obscura 브라우저 XSS 탐지 (--browser 옵션 시)
     │           ├─ 입력 필드 페이로드 인젝션 (8개 selector + 8 polyglot)
     │           ├─ MutationObserver: script/event handler 삽입 감지
     │           └─ URL 파라미터 Reflected XSS
@@ -271,7 +271,7 @@ tokio::main (multi_thread)
 | 비동기 런타임 | `tokio 1` | 멀티스레드 async 실행, `join!`/`spawn_blocking` |
 | CLI | `clap 4` | 인자 파싱, env 변수 연동 |
 | HTTP 클라이언트 | `reqwest 0.12` | HTTP/2, TLS, 동적 커넥션 풀 |
-| 헤드리스 브라우저 | `headless_chrome 1` | DevTools Protocol |
+| 헤드리스 브라우저 | `obscura-browser 0.1` | Rust-native browser engine (V8 via deno_core) |
 | Lua VM | `mlua 0.10` | LuaJIT 5.4, 샌드박스, `spawn_blocking` 병렬 |
 | 상태 DB | `sled 0.34` | 임베디드 K-V 스토어 (스캔 상태 기록용, 향후 SQLite 통합 예정) |
 | CVE DB | `rusqlite 0.31` | SQLite 번들 빌드 |
@@ -503,6 +503,15 @@ sentinel --target https://api.com --auth-header "X-API-Key:sk-12345"
 | llm 사용을 위한 cli 옵션 추가 | 성능 | ✅ `main.rs` |
 | llm_stats 필드 추가 | 성능 | ✅ `report/json.rs` |
 | llm 설정 영역 문서화 | 성능 | ✅ `sentinel.toml` |
+
+#### v0.3.0 (2026-05-02)
+
+| 항목 | 분류 | 상태 |
+|------|------|------|
+| headless_chrome → obscura-browser 교체 | 의존성 | ✅ `browser/controller.rs`, `browser/xss.rs` |
+| Chrome/Chromium 외부 의존성 제거 | 경량화 | ✅ Cargo.toml |
+| 비동기 브라우저 스캔 (spawn_blocking 제거) | 성능 | ✅ `browser/controller.rs` |
+| JS 기반 입력 인젝션 (type_into → evaluate) | 리팩토링 | ✅ `browser/xss.rs` |
 
 ### 향후 로드맵
 

@@ -1,55 +1,27 @@
-use anyhow::{anyhow, Result};
-use headless_chrome::{Browser, LaunchOptions};
+use anyhow::Result;
+use obscura_browser::{BrowserContext, Page};
+use std::sync::Arc;
 use tracing::{debug, info};
+use uuid::Uuid;
 
 use crate::browser::xss::XssDetector;
 use crate::core::scanner::Finding;
 
-/// Launch headless Chrome and perform DOM-based vulnerability analysis
+/// Perform DOM-based vulnerability analysis using the obscura browser engine.
 pub async fn scan_with_browser(target: &str) -> Result<Vec<Finding>> {
-    tokio::task::spawn_blocking({
-        let target = target.to_string();
-        move || run_browser_scan_blocking(&target)
-    })
-    .await?
-}
-
-fn run_browser_scan_blocking(target: &str) -> Result<Vec<Finding>> {
-    let options = LaunchOptions::default_builder()
-        .headless(true)
-        .sandbox(false) // required in some Linux envs
-        .args(vec![
-            std::ffi::OsStr::new("--no-sandbox"),
-            std::ffi::OsStr::new("--disable-dev-shm-usage"),
-            std::ffi::OsStr::new("--disable-gpu"),
-            std::ffi::OsStr::new("--window-size=1280,720"),
-        ])
-        .build()
-        .map_err(|e| anyhow!("Failed to build Chrome options: {:?}", e))?;
-
-    let browser = Browser::new(options)
-        .map_err(|e| anyhow!("Failed to launch Chrome: {:?}", e))?;
-
-    let tab = browser.new_tab()
-        .map_err(|e| anyhow!("Failed to open tab: {:?}", e))?;
+    let ctx_id = Uuid::new_v4().to_string();
+    let context = Arc::new(BrowserContext::new(ctx_id.clone()));
+    let mut page = Page::new(ctx_id, context);
 
     info!("[Browser] Navigating to: {}", target);
-    tab.navigate_to(target)
-        .map_err(|e| anyhow!("Navigation failed: {:?}", e))?
-        .wait_until_navigated()
-        .map_err(|e| anyhow!("Page load timeout: {:?}", e))?;
+    page.navigate(target)
+        .await
+        .map_err(|e| anyhow::anyhow!("Navigation failed: {:?}", e))?;
 
-    // Capture title to verify page loaded
-    let title: String = tab
-        .evaluate("document.title", false)
-        .ok()
-        .and_then(|v| v.value.as_ref().and_then(|v| v.as_str().map(|s| s.to_string())))
-        .unwrap_or_default();
-    debug!("[Browser] Page title: {}", title);
+    debug!("[Browser] Page title: {}", page.title);
 
-    // DOM XSS detection
     let detector = XssDetector::new();
-    let xss_findings = detector.scan(&tab, target)?;
+    let xss_findings = detector.scan(&mut page, target).await?;
 
     Ok(xss_findings)
 }

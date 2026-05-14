@@ -234,7 +234,8 @@ impl ResponseAnalyzer {
 
         let mut findings = Vec::new();
         findings.extend(check_security_headers(&base_resp, target));
-        findings.extend(check_cors(&base_resp, target));
+        // §6.2: use final URL after redirects so CORS finding is attributed correctly
+        findings.extend(check_cors(&base_resp, &base_resp.url));
         findings.extend(check_cookies(&base_resp, target));
         findings.extend(check_mixed_content(&base_resp, target));
         findings.extend(check_info_disclosure(&base_resp, target));
@@ -862,7 +863,33 @@ impl ResponseAnalyzer {
             if let Some(allow) = resp.headers.get("allow") {
                 let allow_upper = allow.to_uppercase();
                 for method in DANGEROUS_METHODS {
-                    if allow_upper.contains(method) {
+                    if !allow_upper.contains(method) {
+                        continue;
+                    }
+                    // §2.1: for TRACE, verify actual body reflection before reporting Medium
+                    if *method == "TRACE" {
+                        let (severity, description) =
+                            if let Ok(tr) = self.client.trace(url).await {
+                                let body_echo = tr.body.contains("TRACE ") || tr.body.contains("User-Agent");
+                                if tr.status == 200 && body_echo {
+                                    (Severity::Medium, "TRACE is enabled and echoes request headers — XST attack is feasible".to_string())
+                                } else {
+                                    (Severity::Low, format!("TRACE method not blocked (OPTIONS reports it allowed) but returns {} — XST not confirmed", tr.status))
+                                }
+                            } else {
+                                (Severity::Low, "TRACE method reported in OPTIONS Allow but actual TRACE request failed".to_string())
+                            };
+                        let mut f = Finding::new(
+                            severity,
+                            FindingCategory::InformationDisclosure,
+                            "Dangerous HTTP method enabled: TRACE",
+                            description,
+                            url.to_string(),
+                        );
+                        f.evidence = Some(format!("OPTIONS Allow: {}", allow));
+                        f.remediation = Some("Disable TRACE method at web server level".to_string());
+                        findings.push(f);
+                    } else {
                         let mut f = Finding::new(
                             Severity::Medium,
                             FindingCategory::InformationDisclosure,
@@ -870,6 +897,7 @@ impl ResponseAnalyzer {
                             format!("OPTIONS response reveals '{}' is allowed", method),
                             url.to_string(),
                         );
+                        f.evidence = Some(format!("OPTIONS Allow: {}", allow));
                         f.remediation = Some(format!("Disable {} method if not required", method));
                         findings.push(f);
                     }
@@ -943,6 +971,37 @@ fn check_security_headers(resp: &HttpResponse, url: &str) -> Vec<Finding> {
         }
     }
 
+    // §6.3: dangerous header value checks (present but misconfigured)
+    if let Some(rp) = headers.get("referrer-policy") {
+        if matches!(rp.as_str(), "unsafe-url" | "unsafe-url-when-cross-origin") {
+            let mut f = Finding::new(
+                Severity::Medium,
+                FindingCategory::InformationDisclosure,
+                format!("Dangerous Referrer-Policy value: {}", rp),
+                "Full URL including query params sent in Referer header to third parties. OAuth codes and API keys in URLs may be exposed.".to_string(),
+                url.to_string(),
+            );
+            f.evidence = Some(format!("Referrer-Policy: {}", rp));
+            f.remediation = Some("Change to 'strict-origin-when-cross-origin'".to_string());
+            findings.push(f);
+        }
+    }
+
+    if let Some(xxp) = headers.get("x-xss-protection") {
+        if xxp.trim() == "0" {
+            let mut f = Finding::new(
+                Severity::Low,
+                FindingCategory::MissingHeader,
+                "X-XSS-Protection explicitly disabled".to_string(),
+                "X-XSS-Protection: 0 disables the browser built-in XSS filter".to_string(),
+                url.to_string(),
+            );
+            f.evidence = Some(format!("X-XSS-Protection: {}", xxp));
+            f.remediation = Some("Remove header or set to '1; mode=block'".to_string());
+            findings.push(f);
+        }
+    }
+
     findings
 }
 
@@ -965,6 +1024,7 @@ fn check_cors(resp: &HttpResponse, url: &str) -> Vec<Finding> {
                     "Access-Control-Allow-Origin: * combined with Allow-Credentials: true allows credential theft".to_string(),
                     url.to_string(),
                 );
+                f.evidence = Some("Access-Control-Allow-Origin: *\nAccess-Control-Allow-Credentials: true".to_string());
                 f.remediation = Some("Never combine wildcard origin with credentials; whitelist specific origins".to_string());
                 findings.push(f);
             } else {
@@ -975,6 +1035,7 @@ fn check_cors(resp: &HttpResponse, url: &str) -> Vec<Finding> {
                     "Access-Control-Allow-Origin: * allows any site to read responses".to_string(),
                     url.to_string(),
                 );
+                f.evidence = Some("Access-Control-Allow-Origin: *".to_string());
                 f.remediation = Some("Restrict to specific trusted origins".to_string());
                 findings.push(f);
             }
@@ -1463,7 +1524,11 @@ fn check_body_patterns(resp: &HttpResponse, url: &str) -> Vec<Finding> {
             if comment.contains(word) {
                 let snippet = &cap[0];
                 let truncated = if snippet.len() > 150 {
-                    format!("{}...", &snippet[..150])
+                    // Use char-boundary-safe truncation to avoid panicking on
+                    // multi-byte UTF-8 sequences (e.g. Korean/CJK in comments).
+                    let mut s: String = snippet.chars().take(150).collect();
+                    s.push_str("...");
+                    s
                 } else {
                     snippet.to_string()
                 };
@@ -1602,6 +1667,7 @@ mod tests {
             thorough: false,
             llm_enabled: false,
             llm_config: crate::llm::config::LlmConfig::default(),
+            no_scripts: false,
         })
     }
 

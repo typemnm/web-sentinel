@@ -50,6 +50,7 @@ impl HttpClient {
 
         let client = Client::builder()
             .timeout(Duration::from_secs(ctx.config.timeout_secs))
+            .connect_timeout(Duration::from_secs(10))
             .pool_max_idle_per_host(pool_size)
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(30))
@@ -60,6 +61,7 @@ impl HttpClient {
 
         let no_redirect_client = Client::builder()
             .timeout(Duration::from_secs(ctx.config.timeout_secs))
+            .connect_timeout(Duration::from_secs(10))
             .pool_max_idle_per_host(pool_size)
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(30))
@@ -182,6 +184,17 @@ impl HttpClient {
             .await?;
         HttpResponse::from_reqwest_headers_only(resp, start.elapsed())
     }
+
+    pub async fn trace(&self, url: &str) -> Result<HttpResponse> {
+        self.wait_rate_limit().await;
+        let start = std::time::Instant::now();
+        let method = reqwest::Method::from_bytes(b"TRACE")
+            .map_err(|e| anyhow::anyhow!("invalid method: {}", e))?;
+        let resp = self.apply_auth(self.inner.request(method, url))
+            .send()
+            .await?;
+        HttpResponse::from_reqwest(resp, start.elapsed()).await
+    }
 }
 
 /// Parsed HTTP response
@@ -246,6 +259,7 @@ mod tests {
             thorough: false,
             llm_enabled: false,
             llm_config: crate::llm::config::LlmConfig::default(),
+            no_scripts: false,
         })
     }
 
@@ -268,6 +282,7 @@ mod tests {
             thorough: false,
             llm_enabled: false,
             llm_config: crate::llm::config::LlmConfig::default(),
+            no_scripts: false,
         });
         let client = HttpClient::new(&ctx);
         assert!(client.is_ok());

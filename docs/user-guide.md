@@ -11,7 +11,7 @@
 | 구성 | 버전 | 비고 |
 |------|------|------|
 | Rust | 1.75+ | `rustup` 권장 |
-| Google Chrome / Chromium | 최신 | `--browser` 옵션 사용 시만 필요 |
+| Google Chrome / Chromium | 불필요 | obscura가 자체 브라우저 엔진 내장 |
 | Linux (x86_64) / macOS | WSL2 포함 | Docker 사용 시 OS 무관 |
 
 ### 방법 A: 바이너리 직접 설치 (권장)
@@ -60,17 +60,9 @@ docker run --rm \
     sentinel:latest --target https://example.com
 ```
 
-### Chromium 설치 (브라우저 스캔 시만 필요)
+### Chromium 설치 (v0.3.0부터 불필요)
 
-```bash
-# Ubuntu / Debian
-sudo apt-get install chromium-browser
-
-# Arch
-sudo pacman -S chromium
-
-# Docker 사용 시 이미지에 포함되어 있어 별도 설치 불필요
-```
+> v0.3.0부터 Sentinel은 obscura 브라우저 엔진을 사용하므로 Chromium/Chrome 별도 설치가 필요 없다.
 
 ---
 
@@ -197,7 +189,7 @@ file = "sentinel_report.json"
 format = "json"
 
 [http]
-user_agent = "Mozilla/5.0 (compatible; Sentinel/0.2.0)"
+user_agent = "Mozilla/5.0 (compatible; Sentinel/0.3.0)"
 follow_redirects = true
 max_redirects = 5
 
@@ -680,22 +672,16 @@ docker compose run sentinel --target http://example.com
 
 ## 9. 트러블슈팅
 
-### Chrome을 찾을 수 없음 (`--browser` 사용 시)
+### 브라우저 스캔 오류 (`--browser` 사용 시)
 
 ```
-Error: Failed to launch Chrome
+Error: Navigation failed
 ```
 
 해결:
 ```bash
-# Chrome/Chromium 경로 확인
-which chromium-browser || which google-chrome
-
-# 없으면 설치
-sudo apt-get install chromium-browser
-
-# Docker 사용 시 이미지에 Chromium 포함되어 있음
-make docker && make docker-run ARGS="--target http://example.com --browser"
+# obscura는 Chromium이 필요 없다. 네트워크/URL을 확인하라.
+sentinel --target http://example.com --browser -vv
 ```
 
 ### 너무 느린 스캔

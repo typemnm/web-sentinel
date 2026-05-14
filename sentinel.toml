@@ -28,17 +28,18 @@ dir = "scripts"
 # LLM-assisted vulnerability analysis (Phase 7)
 # Opt-in: enable via --llm flag or set enabled = true here
 [llm]
-enabled = false
+enabled = true
 provider = "openai-compat"
+# Gemma 4 via Ollama - see /home/typemnm/gemma4/ for setup
 # OpenAI: "https://api.openai.com/v1"
 # Ollama: "http://localhost:11434/v1"
 # vLLM:   "http://localhost:8000/v1"
-api_base = "https://api.openai.com/v1"
-model = "gpt-4o-mini"
+api_base = "http://localhost:11434/v1"
+model = "gemma3:27b"
 # API key: set here or via SENTINEL_LLM_API_KEY env var
 # Leave empty for local servers (Ollama, llama.cpp) that need no auth
 api_key = ""
-api_timeout_secs = 120
+api_timeout_secs = 180
 max_tokens = 2048
 temperature = 0.2
 # Only analyze findings at or above this severity: info, low, medium, high, critical

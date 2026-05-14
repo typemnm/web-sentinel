@@ -51,6 +51,10 @@ pub struct Cli {
     #[arg(long, default_value = "scripts", env = "SENTINEL_SCRIPTS")]
     pub scripts_dir: PathBuf,
 
+    /// Skip Lua script phase entirely
+    #[arg(long)]
+    pub no_scripts: bool,
+
     /// Config file path
     #[arg(long, default_value = "sentinel.toml", env = "SENTINEL_CONFIG")]
     pub config: PathBuf,
@@ -212,6 +216,7 @@ async fn main() -> Result<()> {
         thorough: cli.thorough,
         llm_enabled: llm_config.enabled,
         llm_config,
+        no_scripts: cli.no_scripts,
     };
 
     let mut orchestrator = Orchestrator::new(scan_config).await?;

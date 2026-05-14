@@ -1,11 +1,9 @@
 use anyhow::Result;
-use headless_chrome::Tab;
-use std::sync::Arc;
+use obscura_browser::Page;
 use tracing::info;
 
 use crate::core::scanner::{Finding, FindingCategory, Severity};
 
-/// XSS payloads for DOM testing — basic
 static XSS_PAYLOADS: &[&str] = &[
     "<script>alert('XSS_SENTINEL')</script>",
     "<img src=x onerror=alert('XSS_SENTINEL')>",
@@ -13,26 +11,18 @@ static XSS_PAYLOADS: &[&str] = &[
     "<svg onload=alert('XSS_SENTINEL')>",
 ];
 
-/// Polyglot XSS payloads — designed to bypass multiple contexts at once
-/// (attribute, script, HTML tag, event handler)
 static XSS_POLYGLOTS: &[&str] = &[
-    // Javasript URL handler + event + tag break
     "jaVasCript:/*-/*`/*\\`/*'/*\"/**/(/* */oNcliCk=alert('XSS_SENTINEL') )//",
-    // Attribute breakout + event handler
     "'\"><img/src/onerror=alert('XSS_SENTINEL')>",
-    // Template literal injection (for JS template strings)
     "${alert('XSS_SENTINEL')}",
-    // SVG/XML namespace injection
     "<svg><animate onbegin=alert('XSS_SENTINEL') attributeName=x dur=1s>",
-    // Math tag (MathML — works in some browsers)
     "<math><mtext><table><mglyph><style><!--</style><img title=\"--&gt;&lt;img src=x onerror=alert('XSS_SENTINEL')&gt;\">",
-    // Event without parentheses (bypasses WAF regex for alert())
     "<img src=x onerror=alert`XSS_SENTINEL`>",
-    // Encoded event handler payload
     "<body onpageshow=alert('XSS_SENTINEL')>",
-    // Details/Summary auto-trigger
     "<details open ontoggle=alert('XSS_SENTINEL')>",
 ];
+
+const INPUT_SELECTOR: &str = "input[type='text'], input:not([type]), textarea, input[type='search'], input[type='url'], input[type='email'], input[type='tel'], [contenteditable='true']";
 
 pub struct XssDetector;
 
@@ -41,128 +31,74 @@ impl XssDetector {
         Self
     }
 
-    /// Inject XSS payloads into input fields and detect JS alert execution
-    pub fn scan(&self, tab: &Arc<Tab>, target: &str) -> Result<Vec<Finding>> {
+    pub async fn scan(&self, page: &mut Page, target: &str) -> Result<Vec<Finding>> {
         let mut findings = Vec::new();
 
-        // Intercept alert/prompt/confirm + DOM mutation observer for script injection
-        let _ = tab.evaluate(
-            r#"
-            window.__xss_triggered = false;
-            window.__xss_payload = '';
-            window.__xss_dom_mutation = false;
-            window.alert = function(m) { window.__xss_triggered = true; window.__xss_payload = String(m); };
-            window.prompt = function(m) { window.__xss_triggered = true; window.__xss_payload = String(m); return null; };
-            window.confirm = function(m) { window.__xss_triggered = true; window.__xss_payload = String(m); return false; };
-            // Monitor DOM for injected script/event handler nodes
-            new MutationObserver(function(mutations) {
-                mutations.forEach(function(m) {
-                    m.addedNodes.forEach(function(node) {
-                        if (node.nodeName === 'SCRIPT' || (node.outerHTML && node.outerHTML.match(/on\w+\s*=/i))) {
-                            window.__xss_dom_mutation = true;
-                        }
-                    });
-                });
-            }).observe(document.body || document.documentElement, {childList: true, subtree: true});
-            "#,
-            false,
-        );
-
-        let input_selectors = &[
-            "input[type='text']",
-            "input:not([type])",
-            "textarea",
-            "input[type='search']",
-            "input[type='url']",
-            "input[type='email']",
-            "input[type='tel']",
-            "[contenteditable='true']",
-        ];
-
-        for selector in input_selectors {
-            let elements = match tab.find_elements(selector) {
-                Ok(els) => els,
-                Err(_) => continue,
-            };
-
-            for element in elements {
-                for payload in XSS_PAYLOADS {
-                    // Clear & type payload into input
-                    let _ = element.type_into(payload);
-
-                    // Press Enter via tab JS evaluation (Element has no press_key)
-                    let _ = tab.evaluate(
-                        "document.activeElement && document.activeElement.form && document.activeElement.form.submit()",
-                        false,
-                    );
-
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-
-                    let triggered = Self::check_xss_triggered(tab);
-                    if triggered {
-                        info!("[XSS] DOM XSS confirmed: {}", payload);
-                        let mut f = Finding::new(
-                            Severity::High,
-                            FindingCategory::Xss,
-                            "DOM-based XSS Detected",
-                            format!("XSS confirmed via JS alert(). Payload: {}", payload),
-                            target.to_string(),
-                        );
-                        f.evidence = Some(payload.to_string());
-                        f.remediation = Some(
-                            "Sanitize output; use textContent not innerHTML; apply CSP.".to_string(),
-                        );
-                        findings.push(f);
-                        Self::reset_xss_state(tab);
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Polyglot XSS via input fields (higher bypass rate)
-        for selector in input_selectors {
-            let elements = match tab.find_elements(selector) {
-                Ok(els) => els,
-                Err(_) => continue,
-            };
-
-            for element in elements {
-                for payload in XSS_POLYGLOTS {
-                    let _ = element.type_into(payload);
-                    let _ = tab.evaluate(
-                        "document.activeElement && document.activeElement.form && document.activeElement.form.submit()",
-                        false,
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-
-                    if Self::check_xss_triggered(tab) {
-                        info!("[XSS] Polyglot DOM XSS confirmed: {}", payload);
-                        let mut f = Finding::new(
-                            Severity::High,
-                            FindingCategory::Xss,
-                            "DOM-based XSS (Polyglot Payload)",
-                            format!("XSS confirmed via polyglot payload: {}", payload),
-                            target.to_string(),
-                        );
-                        f.evidence = Some(payload.to_string());
-                        f.remediation = Some(
-                            "Sanitize output; use textContent not innerHTML; apply CSP.".to_string(),
-                        );
-                        findings.push(f);
-                        Self::reset_xss_state(tab);
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Reflected XSS via URL parameter (basic + polyglot)
-        let all_reflected_payloads: Vec<&str> = XSS_PAYLOADS.iter()
+        let all_payloads: Vec<&str> = XSS_PAYLOADS.iter()
             .chain(XSS_POLYGLOTS.iter())
             .copied()
             .collect();
-        for payload in &all_reflected_payloads {
+
+        for (idx, payload) in all_payloads.iter().enumerate() {
+            // Re-navigate to the original target before each payload attempt.
+            // A previous iteration's form.submit() may have navigated the page away,
+            // making subsequent evaluations run against the wrong document.
+            if idx > 0 && page.navigate(target).await.is_err() {
+                continue;
+            }
+            Self::setup_xss_hooks(page);
+
+            let payload_json = serde_json::to_string(payload).unwrap_or_default();
+            let selector_json = serde_json::to_string(INPUT_SELECTOR).unwrap_or_default();
+            let js = format!(
+                r#"(function() {{
+                    var inputs = document.querySelectorAll({sel});
+                    if (!inputs || inputs.length === 0) {{ return 0; }}
+                    for (var i = 0; i < inputs.length; i++) {{
+                        inputs[i].value = {p};
+                        var form = inputs[i].form;
+                        if (form) {{ try {{ form.submit(); }} catch(e) {{}} }}
+                    }}
+                    return inputs.length;
+                }})()"#,
+                sel = selector_json,
+                p = payload_json,
+            );
+
+            let injected = page.evaluate(&js).as_i64().unwrap_or(0);
+            if injected > 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                if Self::check_xss_triggered(page) {
+                    info!("[XSS] DOM XSS confirmed: {}", payload);
+                    let is_polyglot = XSS_POLYGLOTS.contains(payload);
+                    let title = if is_polyglot {
+                        "DOM-based XSS (Polyglot Payload)"
+                    } else {
+                        "DOM-based XSS Detected"
+                    };
+                    let description = if is_polyglot {
+                        format!("XSS confirmed via polyglot payload: {}", payload)
+                    } else {
+                        format!("XSS confirmed via JS alert(). Payload: {}", payload)
+                    };
+                    let mut f = Finding::new(
+                        Severity::High,
+                        FindingCategory::Xss,
+                        title,
+                        description,
+                        target.to_string(),
+                    );
+                    f.evidence = Some(payload.to_string());
+                    f.remediation = Some(
+                        "Sanitize output; use textContent not innerHTML; apply CSP.".to_string(),
+                    );
+                    findings.push(f);
+                    Self::reset_xss_state(page);
+                }
+            }
+        }
+
+        for payload in &all_payloads {
             let encoded = percent_encode(payload);
             let test_url = if target.contains('?') {
                 format!("{}&q={}", target, encoded)
@@ -170,15 +106,10 @@ impl XssDetector {
                 format!("{}?q={}", target, encoded)
             };
 
-            Self::reset_xss_state(tab);
-
-            let nav_ok = tab.navigate_to(&test_url)
-                .and_then(|t| t.wait_until_navigated())
-                .is_ok();
-
-            if nav_ok {
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                if Self::check_xss_triggered(tab) {
+            if page.navigate(&test_url).await.is_ok() {
+                Self::setup_xss_hooks(page);
+                tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                if Self::check_xss_triggered(page) {
                     info!("[XSS] Reflected XSS: {}", payload);
                     let mut f = Finding::new(
                         Severity::High,
@@ -197,27 +128,50 @@ impl XssDetector {
         Ok(findings)
     }
 
-    fn check_xss_triggered(tab: &Arc<Tab>) -> bool {
-        let alert_triggered = tab.evaluate("!!window.__xss_triggered", false)
-            .ok()
-            .and_then(|v| v.value.as_ref().and_then(|v| v.as_bool()))
+    fn setup_xss_hooks(page: &mut Page) {
+        page.evaluate(
+            r#"
+            window.__xss_triggered = false;
+            window.__xss_payload = '';
+            window.__xss_dom_mutation = false;
+            window.alert = function(m) { window.__xss_triggered = true; window.__xss_payload = String(m); };
+            window.prompt = function(m) { window.__xss_triggered = true; window.__xss_payload = String(m); return null; };
+            window.confirm = function(m) { window.__xss_triggered = true; window.__xss_payload = String(m); return false; };
+            (function() {
+                try {
+                    new MutationObserver(function(mutations) {
+                        mutations.forEach(function(m) {
+                            m.addedNodes.forEach(function(node) {
+                                if (node.nodeName === 'SCRIPT' || (node.outerHTML && node.outerHTML.match(/on\w+\s*=/i))) {
+                                    window.__xss_dom_mutation = true;
+                                }
+                            });
+                        });
+                    }).observe(document.body || document.documentElement, {childList: true, subtree: true});
+                } catch(e) {}
+            })();
+            "#,
+        );
+    }
+
+    fn check_xss_triggered(page: &mut Page) -> bool {
+        let alert_triggered = page.evaluate("!!window.__xss_triggered")
+            .as_bool()
             .unwrap_or(false);
-        let dom_mutation = tab.evaluate("!!window.__xss_dom_mutation", false)
-            .ok()
-            .and_then(|v| v.value.as_ref().and_then(|v| v.as_bool()))
+        let dom_mutation = page.evaluate("!!window.__xss_dom_mutation")
+            .as_bool()
             .unwrap_or(false);
         alert_triggered || dom_mutation
     }
 
-    fn reset_xss_state(tab: &Arc<Tab>) {
-        let _ = tab.evaluate(
+    fn reset_xss_state(page: &mut Page) {
+        page.evaluate(
             r#"
             window.__xss_triggered = false;
             window.__xss_payload = '';
             window.__xss_dom_mutation = false;
             window.alert = function(m) { window.__xss_triggered = true; window.__xss_payload = String(m); };
             "#,
-            false,
         );
     }
 }

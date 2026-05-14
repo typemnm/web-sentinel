@@ -1,7 +1,7 @@
 [package]
 name = "sentinel"
-version = "0.2.0"
-edition = "2026"
+version = "0.3.0"
+edition = "2021"
 description = "Project Sentinel - CERT Web Vulnerability Scanner"
 authors = ["CERT Security Team"]
 license = "MIT"
@@ -66,7 +66,7 @@ regex = "1"
 memchr = "2"
 
 # Headless browser
-headless_chrome = "1"
+obscura-browser = { git = "https://github.com/h4ckf0r0day/obscura" }
 
 [dev-dependencies]
 wiremock = "0.6"

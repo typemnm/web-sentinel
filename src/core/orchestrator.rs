@@ -137,7 +137,7 @@ impl Orchestrator {
         );
 
         let scripts_dir   = self.ctx.config.scripts_dir.clone();
-        let scripts_exist = scripts_dir.exists();
+        let scripts_exist = scripts_dir.exists() && !self.ctx.config.no_scripts;
         let ctx_clone     = self.ctx.clone();
         let client_clone  = http_client.clone();
         let target_clone  = target.clone();
